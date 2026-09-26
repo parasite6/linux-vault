@@ -1,0 +1,11 @@
+[package]
+name = "linux-vault"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Lock, test, delete, and unlock a vault with 7z. No root, D-Bus, or pinentry."
+license = "GPL-3.0-only"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

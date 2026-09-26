@@ -3,7 +3,7 @@
 
 # Build output
 /build/
-/target/
+target/
 /dist/
 /out/
 *.rpm

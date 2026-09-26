@@ -1,0 +1,10 @@
+[package]
+name = "sevenz-stdin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Spike: 7-Zip stdin passphrase round trip"
+
+[[bin]]
+name = "sevenz-stdin"
+path = "src/main.rs"

@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/linux-vault"]
+resolver = "2"
