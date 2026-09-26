@@ -1,0 +1,33 @@
+[Unit]
+Description=Linux Vault helper
+After=polkit.service
+Requires=polkit.service
+# Stop, and finish locking, before /home is unmounted. Services stop in
+# reverse start order, so this orders the helper ahead of that mount.
+RequiresMountsFor=/home
+
+[Service]
+Type=dbus
+BusName=org.linuxvault.Helper
+ExecStart=/usr/libexec/linux-vault-helper
+Restart=on-failure
+# logind waits InhibitDelayMaxSec=120. The default of 90 seconds would
+# SIGKILL a lock that logind was still waiting for.
+TimeoutStopSec=120
+# Anything outside this set is unavailable, including to an exploit.
+# CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH stay out. A mode 700 home is
+# read by the worker, which runs as the vault owner.
+CapabilityBoundingSet=CAP_LINUX_IMMUTABLE CAP_FOWNER CAP_SETUID CAP_SETGID CAP_IPC_LOCK CAP_SYS_PTRACE
+# The filesystem is read-only except the registry and home. Children
+# inherit these mounts, so 7z needs /home writable. ProtectHome stays
+# unset. Pinentry is started in the user manager, outside this sandbox.
+# PrivateTmp gives the helper and its worker a writable /tmp of their own.
+ProtectSystem=strict
+PrivateTmp=yes
+StateDirectory=linux-vault
+ReadWritePaths=/var/lib/linux-vault /home
+# Passphrase pages stay resident. CAP_IPC_LOCK is already in the bounding set.
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

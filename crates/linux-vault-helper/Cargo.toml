@@ -1,0 +1,21 @@
+[package]
+name = "linux-vault-helper"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Root helper for linux-vault. D-Bus service."
+license = "GPL-3.0-only"
+
+[dependencies]
+linux-vault = { path = "../linux-vault" }
+linux-vault-dbus = { path = "../linux-vault-dbus" }
+nix = { version = "0.30", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time", "net", "signal"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+zeroize = "1"
+zbus = { version = "5", features = ["p2p", "tokio"] }
+zvariant = "5"
+linux-keyutils = "0.2.5"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "sync", "time", "net", "signal"] }

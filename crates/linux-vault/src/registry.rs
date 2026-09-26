@@ -1,7 +1,6 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process;
 
 use serde::{Deserialize, Serialize};
 
@@ -30,53 +29,32 @@ pub struct Registry {
     vaults: Vec<Record>,
 }
 
+/// Exclusive `flock` on `.lock`. The kernel drops it when this file is closed
+/// or the process dies. The file itself stays, so the next caller locks the
+/// same inode.
 pub struct LockFile {
-    path: PathBuf,
+    file: File,
+}
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        // Closing `file` is what releases the flock.
+        let _open_until_drop = &self.file;
+    }
 }
 
 impl LockFile {
     pub fn acquire(dir: &Path) -> Result<Self> {
         let path = dir.join(LOCK_NAME);
-        match try_create(&path) {
-            Ok(()) => return Ok(Self { path }),
-            Err(Error::Busy) => {}
-            Err(error) => return Err(error),
-        }
-        if stale(&path) {
-            let _ = fs::remove_file(&path);
-            try_create(&path)?;
-            return Ok(Self { path });
-        }
-        Err(Error::Busy)
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        file.lock()?;
+        Ok(Self { file })
     }
-}
-
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn try_create(path: &Path) -> Result<()> {
-    match File::options().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            writeln!(file, "{}", process::id())?;
-            file.sync_all()?;
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::Busy),
-        Err(error) => Err(error.into()),
-    }
-}
-
-fn stale(path: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(path) else {
-        return false;
-    };
-    let Some(pid) = text.trim().parse::<u32>().ok() else {
-        return false;
-    };
-    !Path::new(&format!("/proc/{pid}")).exists()
 }
 
 impl Registry {

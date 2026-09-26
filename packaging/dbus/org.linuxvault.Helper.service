@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=org.linuxvault.Helper
+Exec=/usr/libexec/linux-vault-helper
+User=root
+SystemdService=linux-vault-helper.service

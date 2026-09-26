@@ -1,7 +1,10 @@
 //! Lock, test, delete, and unlock a folder with 7z, and remember that in a registry.
 //!
-//! The passphrase is borrowed bytes. This crate does not start pinentry, talk on
-//! D-Bus, set the immutable flag, or drop privileges. Run it as the vault owner.
+//! The passphrase is borrowed bytes. This crate does not start pinentry or talk
+//! on D-Bus. `7z` runs as this process unless [`Vaults::for_user`] names the
+//! vault owner's uid and gid. That call uses `setuid` and `setgid`, so the
+//! child cannot switch back to root. The immutable flag is the ioctl on the
+//! archive, not the `chattr` command.
 //! Point [`Vaults::open`] at a registry directory and the root the vaults must
 //! stay inside (a temporary directory in tests, the user's home in the helper).
 //!
@@ -13,19 +16,59 @@
 //! because this process does not have the passphrase.
 
 mod error;
+mod immutable;
 mod registry;
 mod sevenz;
 
 use std::fs::{self, File};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 
 use error::Result;
 use registry::{LockFile, Record, Registry};
-use sevenz::{command_args, find_seven_zip, run, run_without_passphrase};
+use sevenz::{
+    command_args, find_seven_zip, run, run_interruptible, run_without_passphrase, Credentials,
+};
 
 pub use error::Error;
+
+/// One change of the immutable bit, recorded when tests replace the ioctl.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlagChange {
+    /// The bit was cleared.
+    Clear,
+    /// The bit was set.
+    Set,
+}
+
+/// Calls recorded by [`Vaults::trace_immutable_flag`].
+#[derive(Clone, Debug)]
+pub struct ImmutableTrace {
+    calls: Arc<Mutex<Vec<FlagChange>>>,
+}
+
+impl ImmutableTrace {
+    pub fn calls(&self) -> Vec<FlagChange> {
+        self.calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+type FlagHook = Arc<dyn Fn(&Path, bool) -> Result<()> + Send + Sync>;
+
+#[derive(Clone)]
+enum FlagBackend {
+    Ioctl,
+    Record(Arc<Mutex<Vec<FlagChange>>>),
+    /// The worker opens the archive and the helper applies the ioctl.
+    Hook(FlagHook),
+}
 
 /// Where a vault's bytes are, and whether a restart lost the passphrase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -38,6 +81,10 @@ pub enum State {
     /// The folder is plaintext and this process does not have the passphrase.
     /// Lock asks for it again; there is no archive to check it against.
     NeedsRecovery,
+    /// Lock has started. `7z` is running, and the registry file is not locked.
+    Locking,
+    /// Unlock has started. `7z` is running, and the registry file is not locked.
+    Unlocking,
 }
 
 impl std::fmt::Display for State {
@@ -46,8 +93,19 @@ impl std::fmt::Display for State {
             State::Unlocked => "unlocked",
             State::Locked => "locked",
             State::NeedsRecovery => "needs recovery",
+            State::Locking => "locking",
+            State::Unlocking => "unlocking",
         })
     }
+}
+
+/// What [`Vaults::reconcile`] changed.
+pub struct Reconciled {
+    /// Vaults still registered.
+    pub vaults: Vec<Vault>,
+    /// Paths whose folder and archive were both gone. The registry entry was
+    /// removed. These are finished terminates, not vaults that need recovery.
+    pub removed: Vec<PathBuf>,
 }
 
 /// A registered vault. `path` is the plaintext folder, present or not.
@@ -63,6 +121,16 @@ pub struct Vaults {
     registry_dir: PathBuf,
     allowed_root: PathBuf,
     seven_zip: PathBuf,
+    /// Serializes `flock` calls. Two flocks on different descriptors in one
+    /// process block each other, including on the same thread.
+    registry_gate: Arc<Mutex<()>>,
+    /// Uid and gid of the `7z` child. Absent means this process, which is the
+    /// vault owner in tests. The helper sets it to the caller.
+    run_as: Option<Credentials>,
+    flags: FlagBackend,
+    /// When set, an unlock that is still extracting kills `7z` and restores
+    /// the immutable flag. A lock that is already packing does not look at this.
+    stop_extract: Arc<AtomicBool>,
 }
 
 impl Vaults {
@@ -78,7 +146,107 @@ impl Vaults {
             registry_dir,
             allowed_root,
             seven_zip: find_seven_zip()?,
+            registry_gate: Arc::new(Mutex::new(())),
+            run_as: None,
+            flags: FlagBackend::Ioctl,
+            stop_extract: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Same registry and `7z`, with a different directory vaults must stay inside.
+    ///
+    /// The registry mutex is shared, so two views of one registry do not
+    /// `flock` separate descriptors at the same time.
+    pub fn for_root(&self, allowed_root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            registry_dir: self.registry_dir.clone(),
+            allowed_root: allowed_root.as_ref().canonicalize()?,
+            seven_zip: self.seven_zip.clone(),
+            registry_gate: Arc::clone(&self.registry_gate),
+            run_as: self.run_as,
+            flags: self.flags.clone(),
+            stop_extract: Arc::clone(&self.stop_extract),
+        })
+    }
+
+    /// Another handle on the same registry. Does not touch the filesystem.
+    pub fn share(&self) -> Self {
+        Self {
+            registry_dir: self.registry_dir.clone(),
+            allowed_root: self.allowed_root.clone(),
+            seven_zip: self.seven_zip.clone(),
+            registry_gate: Arc::clone(&self.registry_gate),
+            run_as: self.run_as,
+            flags: self.flags.clone(),
+            stop_extract: Arc::clone(&self.stop_extract),
+        }
+    }
+
+    /// The worker uses this so an immutable-flag change is sent to the helper.
+    pub fn with_flag_hook<F>(&self, hook: F) -> Self
+    where
+        F: Fn(&Path, bool) -> Result<()> + Send + Sync + 'static,
+    {
+        Self {
+            registry_dir: self.registry_dir.clone(),
+            allowed_root: self.allowed_root.clone(),
+            seven_zip: self.seven_zip.clone(),
+            registry_gate: Arc::clone(&self.registry_gate),
+            run_as: None,
+            flags: FlagBackend::Hook(Arc::new(hook)),
+            stop_extract: Arc::clone(&self.stop_extract),
+        }
+    }
+
+    /// Share one stop flag, so a signal in the worker can abort an extract.
+    pub fn with_stop_flag(&self, flag: Arc<AtomicBool>) -> Self {
+        Self {
+            registry_dir: self.registry_dir.clone(),
+            allowed_root: self.allowed_root.clone(),
+            seven_zip: self.seven_zip.clone(),
+            registry_gate: Arc::clone(&self.registry_gate),
+            run_as: self.run_as,
+            flags: self.flags.clone(),
+            stop_extract: flag,
+        }
+    }
+
+    /// Run `7z` as `uid`/`gid` instead of this process.
+    ///
+    /// The registry stays with this process. Only the `7z` child switches.
+    /// Supplementary groups are cleared when this process can (`CAP_SETGID`).
+    pub fn for_user(&self, uid: u32, gid: u32) -> Self {
+        Self {
+            registry_dir: self.registry_dir.clone(),
+            allowed_root: self.allowed_root.clone(),
+            seven_zip: self.seven_zip.clone(),
+            registry_gate: Arc::clone(&self.registry_gate),
+            run_as: Some(Credentials { uid, gid }),
+            flags: self.flags.clone(),
+            stop_extract: Arc::clone(&self.stop_extract),
+        }
+    }
+
+    /// Kill an unlock's `7z` if it is still extracting, and restore the flag.
+    pub fn request_stop_extract(&self) {
+        self.stop_extract.store(true, Ordering::SeqCst);
+    }
+
+    /// Record immutable-flag changes instead of calling the ioctl.
+    ///
+    /// Tests use this. The helper does not: it uses the ioctl.
+    pub fn trace_immutable_flag(&self) -> (Self, ImmutableTrace) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let vaults = Self {
+            registry_dir: self.registry_dir.clone(),
+            allowed_root: self.allowed_root.clone(),
+            seven_zip: self.seven_zip.clone(),
+            registry_gate: Arc::clone(&self.registry_gate),
+            run_as: self.run_as,
+            flags: FlagBackend::Record(Arc::clone(&calls)),
+            stop_extract: Arc::clone(&self.stop_extract),
+        };
+        (vaults, ImmutableTrace { calls })
     }
 
     /// Use this `7z` binary instead of the one found on `PATH`.
@@ -96,13 +264,14 @@ impl Vaults {
         if archive_for(&path).exists() {
             return Err(Error::AlreadyExists);
         }
-        let (_lock, mut registry) = self.locked()?;
-        registry.insert(Record {
-            name: name.clone(),
-            path: path.clone(),
-            state: State::Unlocked,
+        self.write(|registry| {
+            registry.insert(Record {
+                name: name.clone(),
+                path: path.clone(),
+                state: State::Unlocked,
+            })?;
+            Ok(())
         })?;
-        registry.save()?;
         Ok(Vault {
             name,
             path,
@@ -111,13 +280,11 @@ impl Vaults {
     }
 
     pub fn list(&self) -> Result<Vec<Vault>> {
-        let (_lock, registry) = self.locked()?;
-        Ok(registry.iter().map(Vault::from).collect())
+        self.read(|registry| Ok(registry.iter().map(Vault::from).collect()))
     }
 
     pub fn get(&self, name: &str) -> Result<Vault> {
-        let (_lock, registry) = self.locked()?;
-        registry.get(name).map(Vault::from)
+        self.read(|registry| registry.get(name).map(Vault::from))
     }
 
     /// Apply recovery from the filenames in each vault's parent directory.
@@ -131,36 +298,71 @@ impl Vaults {
     ///   before the delete. The plaintext folder is deleted and the vault is
     ///   locked. Both copies are complete, and the locked one is kept.
     /// - Archive only: locked.
-    /// - Folder only, or neither: needs recovery.
-    pub fn reconcile(&self) -> Result<Vec<Vault>> {
-        let (_lock, mut registry) = self.locked()?;
-        let names: Vec<String> = registry.iter().map(|record| record.name.clone()).collect();
-        for name in names {
-            let record = registry.get(&name)?.clone();
-            let parent = parent_dir(&record.path)?;
-            let unlocking = parent.join(unlocking_file_name(&record.path)?);
-            let partial = parent.join(partial_file_name(&record.path)?);
-            if unlocking.symlink_metadata().is_ok() {
-                remove_path(&unlocking)?;
-            }
-            if partial.symlink_metadata().is_ok() {
-                remove_path(&partial)?;
-            }
-            let folder = record.path.is_dir();
-            let archive = archive_for(&record.path).is_file();
-            let state = match (folder, archive) {
-                (true, true) => {
+    /// - Folder only: needs recovery.
+    /// - Neither: a terminate finished. The registry entry is removed.
+    ///   [`Reconciled::removed`] is those paths, so the helper can drop the
+    ///   bookmark. They are not reported as needing recovery.
+    ///
+    /// A `locking` or `unlocking` mark left by a killed process is not kept.
+    /// The filenames decide the state, same as any other restart.
+    pub fn reconcile(&self) -> Result<Reconciled> {
+        let (listed, locked, removed) = self.write(|registry| {
+            let names: Vec<String> = registry.iter().map(|record| record.name.clone()).collect();
+            let mut locked = Vec::new();
+            let mut removed = Vec::new();
+            for name in names {
+                let record = registry.get(&name)?.clone();
+                let parent = parent_dir(&record.path)?;
+                let unlocking = parent.join(unlocking_file_name(&record.path)?);
+                let partial = parent.join(partial_file_name(&record.path)?);
+                if unlocking.symlink_metadata().is_ok() {
+                    remove_path(&unlocking)?;
+                }
+                if partial.symlink_metadata().is_ok() {
+                    remove_path(&partial)?;
+                }
+                let folder = record.path.is_dir();
+                let archive = archive_for(&record.path).is_file();
+                if !folder && !archive {
+                    registry.remove(&name)?;
+                    removed.push(record.path);
+                    sync_dir(&parent)?;
+                    continue;
+                }
+                let state = if folder && archive {
                     fs::remove_dir_all(&record.path)?;
                     State::Locked
+                } else if archive {
+                    State::Locked
+                } else {
+                    State::NeedsRecovery
+                };
+                sync_dir(&parent)?;
+                if state == State::Locked {
+                    locked.push(record.path.clone());
                 }
-                (false, true) => State::Locked,
-                _ => State::NeedsRecovery,
-            };
-            sync_dir(&parent)?;
-            registry.get_mut(&name)?.state = state;
+                registry.get_mut(&name)?.state = state;
+            }
+            Ok((registry.iter().map(Vault::from).collect(), locked, removed))
+        })?;
+        for path in locked {
+            self.mark_immutable(&path, true)?;
         }
-        registry.save()?;
-        Ok(registry.iter().map(Vault::from).collect())
+        Ok(Reconciled {
+            vaults: listed,
+            removed,
+        })
+    }
+
+    /// The folder is still plaintext and this process has no passphrase for it.
+    pub fn mark_needs_recovery(&self, name: &str) -> Result<()> {
+        self.write(|registry| {
+            let entry = registry.get_mut(name)?;
+            if matches!(entry.state, State::Unlocked | State::NeedsRecovery) {
+                entry.state = State::NeedsRecovery;
+            }
+            Ok(())
+        })
     }
 
     /// Archive the folder into a partial sibling, check it, rename it into
@@ -176,29 +378,50 @@ impl Vaults {
     /// archive is removed and the folder stays.
     pub fn lock(&self, name: &str, passphrase: &[u8]) -> Result<()> {
         check_passphrase(passphrase)?;
-        let (_lock, mut registry) = self.locked()?;
-        let record = registry.get(name)?.clone();
-        match record.state {
-            State::Unlocked | State::NeedsRecovery => {}
-            State::Locked => {
-                return Err(Error::InvalidState {
-                    state: record.state,
-                    operation: "lock",
-                })
+        let record = self.write(|registry| {
+            let record = registry.get(name)?.clone();
+            match record.state {
+                State::Unlocked | State::NeedsRecovery => {}
+                state => {
+                    return Err(Error::InvalidState {
+                        state,
+                        operation: "lock",
+                    })
+                }
             }
-        }
-        if !record.path.is_dir() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "vault folder is missing",
-            )));
-        }
-        refuse_escaping_symlinks(&record.path)?;
-        let parent = parent_dir(&record.path)?;
+            if !record.path.is_dir() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "vault folder is missing",
+                )));
+            }
+            refuse_escaping_symlinks(&record.path)?;
+            let parent = parent_dir(&record.path)?;
+            if archive_for(&record.path).exists() {
+                return Err(Error::AlreadyExists);
+            }
+            registry.get_mut(name)?.state = State::Locking;
+            Ok((record, parent))
+        })?;
+        let (record, parent) = record;
+        let packed = self.pack(&record, &parent, passphrase);
+        let previous = record.state;
+        self.write(|registry| {
+            let entry = registry.get_mut(name)?;
+            entry.state = if packed.is_ok()
+                || (!record.path.exists() && archive_for(&record.path).is_file())
+            {
+                State::Locked
+            } else {
+                previous
+            };
+            Ok(())
+        })?;
+        packed
+    }
+
+    fn pack(&self, record: &Record, parent: &Path, passphrase: &[u8]) -> Result<()> {
         let final_path = archive_for(&record.path);
-        if final_path.exists() {
-            return Err(Error::AlreadyExists);
-        }
         let partial_name = partial_file_name(&record.path)?;
         let partial_path = parent.join(&partial_name);
         if partial_path.symlink_metadata().is_ok() {
@@ -208,17 +431,23 @@ impl Vaults {
         let archive_arg = format!("../{partial_name}");
         let mut args = command_args("a", &archive_arg, None);
         args.push(".".to_string());
-        if let Err(error) = run(&self.seven_zip, &args, &record.path, passphrase) {
+        if let Err(error) = run(
+            &self.seven_zip,
+            &args,
+            &record.path,
+            passphrase,
+            self.run_as,
+        ) {
             discard_path(&partial_path);
             return Err(error);
         }
 
         let checked = (|| {
             sync_file(&partial_path)?;
-            sync_dir(&parent)?;
-            self.require_encrypted(&parent, &partial_name)?;
+            sync_dir(parent)?;
+            self.require_encrypted(parent, &partial_name)?;
             let test_args = command_args("t", &partial_name, None);
-            run(&self.seven_zip, &test_args, &parent, passphrase)?;
+            run(&self.seven_zip, &test_args, parent, passphrase, self.run_as)?;
             Ok(())
         })();
         if let Err(error) = checked {
@@ -230,19 +459,16 @@ impl Vaults {
         // rename(2) only makes the new name atomic in the page cache. fsync
         // the parent before deleting the folder, or a power cut can persist
         // the delete and leave Name.7z.lve-partial, which reconcile removes.
-        sync_dir(&parent)?;
+        sync_dir(parent)?;
         fs::remove_dir_all(&record.path)?;
-        sync_dir(&parent)?;
-        registry.get_mut(name)?.state = State::Locked;
-        registry.save()?;
-        Ok(())
+        sync_dir(parent)?;
+        self.mark_immutable(&record.path, true)
     }
 
     /// Test the archive with `7z t`. Does not change the vault.
     pub fn test(&self, name: &str, passphrase: &[u8]) -> Result<()> {
         check_passphrase(passphrase)?;
-        let (_lock, registry) = self.locked()?;
-        let record = registry.get(name)?.clone();
+        let record = self.read(|registry| Ok(registry.get(name)?.clone()))?;
         if record.state != State::Locked {
             return Err(Error::InvalidState {
                 state: record.state,
@@ -262,33 +488,78 @@ impl Vaults {
     /// leaves the archive as the only copy.
     pub fn unlock(&self, name: &str, passphrase: &[u8]) -> Result<()> {
         check_passphrase(passphrase)?;
-        let (_lock, mut registry) = self.locked()?;
-        let record = registry.get(name)?.clone();
-        if record.state != State::Locked {
-            return Err(Error::InvalidState {
-                state: record.state,
-                operation: "unlock",
-            });
-        }
-        if record.path.exists() {
-            return Err(Error::AlreadyExists);
-        }
+        let record = self.write(|registry| {
+            let record = registry.get(name)?.clone();
+            if record.state != State::Locked {
+                return Err(Error::InvalidState {
+                    state: record.state,
+                    operation: "unlock",
+                });
+            }
+            if record.path.exists() {
+                return Err(Error::AlreadyExists);
+            }
+            let archive = archive_for(&record.path);
+            if !archive.is_file() {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "vault archive is missing",
+                )));
+            }
+            registry.get_mut(name)?.state = State::Unlocking;
+            Ok(record)
+        })?;
+        let extracted = self.extract(&record, passphrase);
+        self.write(|registry| {
+            let entry = registry.get_mut(name)?;
+            entry.state = if extracted.is_ok()
+                || (record.path.is_dir() && !archive_for(&record.path).exists())
+            {
+                State::Unlocked
+            } else {
+                State::Locked
+            };
+            Ok(())
+        })?;
+        extracted
+    }
+
+    fn extract(&self, record: &Record, passphrase: &[u8]) -> Result<()> {
         let archive = archive_for(&record.path);
-        if !archive.is_file() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "vault archive is missing",
-            )));
-        }
         let parent = parent_dir(&record.path)?;
         let archive_name = file_name(&archive)?;
+        self.mark_immutable(&record.path, false)?;
+        let extracted = self.extract_cleared(record, passphrase, &archive, &parent, &archive_name);
+        if extracted.is_err() {
+            // The archive cannot be deleted while immutable, so the flag was
+            // cleared first. A wrong passphrase or any other failure puts it back.
+            let _ = self.mark_immutable(&record.path, true);
+        }
+        extracted
+    }
+
+    fn extract_cleared(
+        &self,
+        record: &Record,
+        passphrase: &[u8],
+        archive: &Path,
+        parent: &Path,
+        archive_name: &str,
+    ) -> Result<()> {
         let staging_name = unlocking_file_name(&record.path)?;
         let staging = parent.join(&staging_name);
         if staging.symlink_metadata().is_ok() {
             remove_path(&staging)?;
         }
-        let args = command_args("x", &archive_name, Some(&staging_name));
-        if let Err(error) = run(&self.seven_zip, &args, &parent, passphrase) {
+        let args = command_args("x", archive_name, Some(&staging_name));
+        if let Err(error) = run_interruptible(
+            &self.seven_zip,
+            &args,
+            parent,
+            passphrase,
+            self.run_as,
+            &self.stop_extract,
+        ) {
             discard_path(&staging);
             return Err(error);
         }
@@ -297,7 +568,7 @@ impl Vaults {
             // after the rename makes the directory entry durable; it does not
             // flush file bytes that are still in the page cache.
             sync_tree(&staging)?;
-            sync_dir(&parent)?;
+            sync_dir(parent)?;
             Ok(())
         })() {
             discard_path(&staging);
@@ -307,12 +578,209 @@ impl Vaults {
         // Same ordering as lock: the new directory entry must be on disk
         // before the archive is deleted. Otherwise a power cut leaves only
         // .Name.lve-unlocking, and reconcile deletes it.
-        sync_dir(&parent)?;
-        fs::remove_file(&archive)?;
-        sync_dir(&parent)?;
-        registry.get_mut(name)?.state = State::Unlocked;
-        registry.save()?;
+        sync_dir(parent)?;
+        fs::remove_file(archive)?;
+        sync_dir(parent)?;
         Ok(())
+    }
+
+    fn mark_immutable(&self, vault: &Path, set: bool) -> Result<()> {
+        let parent = parent_dir(vault)?;
+        let name = file_name(&archive_for(vault))?;
+        let owner = self.owner_uid(&parent)?;
+        match &self.flags {
+            FlagBackend::Ioctl => immutable::change(&parent, &name, owner, set),
+            FlagBackend::Record(calls) => {
+                record_flag(calls, set);
+                Ok(())
+            }
+            FlagBackend::Hook(hook) => hook(&archive_for(vault), set),
+        }
+    }
+
+    /// `fstat` the descriptor a worker sent, then change the immutable bit.
+    ///
+    /// A recorded backend (tests) notes the change and does not call the ioctl.
+    pub fn apply_flag_fd(&self, fd: std::os::fd::RawFd, owner: u32, set: bool) -> Result<()> {
+        match &self.flags {
+            FlagBackend::Ioctl => immutable::change_fd(fd, owner, set),
+            FlagBackend::Record(calls) => {
+                record_flag(calls, set);
+                Ok(())
+            }
+            FlagBackend::Hook(_) => Ok(()),
+        }
+    }
+
+    /// Register a folder the worker has already created and canonicalized.
+    ///
+    /// Does not open the path. The worker checked that it is inside the home.
+    pub fn register_unlocked(&self, path: &Path) -> Result<Vault> {
+        let name = vault_name(path)?;
+        if path != self.allowed_root && !path.starts_with(&self.allowed_root) {
+            return Err(Error::OutsideRoot);
+        }
+        self.write(|registry| {
+            registry.insert(Record {
+                name: name.clone(),
+                path: path.to_path_buf(),
+                state: State::Unlocked,
+            })?;
+            Ok(())
+        })?;
+        Ok(Vault {
+            name,
+            path: path.to_path_buf(),
+            state: State::Unlocked,
+        })
+    }
+
+    /// Mark a lock as started. Does not look at the home directory.
+    pub fn begin_lock(&self, name: &str) -> Result<(PathBuf, State)> {
+        self.write(|registry| {
+            let record = registry.get(name)?.clone();
+            match record.state {
+                State::Unlocked | State::NeedsRecovery => {}
+                state => {
+                    return Err(Error::InvalidState {
+                        state,
+                        operation: "lock",
+                    })
+                }
+            }
+            registry.get_mut(name)?.state = State::Locking;
+            Ok((record.path, record.state))
+        })
+    }
+
+    pub fn finish_lock(&self, name: &str, previous: State, ok: bool) -> Result<()> {
+        self.write(|registry| {
+            registry.get_mut(name)?.state = if ok { State::Locked } else { previous };
+            Ok(())
+        })
+    }
+
+    pub fn begin_unlock(&self, name: &str) -> Result<PathBuf> {
+        self.write(|registry| {
+            let record = registry.get(name)?.clone();
+            if record.state != State::Locked {
+                return Err(Error::InvalidState {
+                    state: record.state,
+                    operation: "unlock",
+                });
+            }
+            registry.get_mut(name)?.state = State::Unlocking;
+            Ok(record.path)
+        })
+    }
+
+    pub fn finish_unlock(&self, name: &str, ok: bool) -> Result<()> {
+        self.write(|registry| {
+            registry.get_mut(name)?.state = if ok { State::Unlocked } else { State::Locked };
+            Ok(())
+        })
+    }
+
+    pub fn set_state(&self, name: &str, state: State) -> Result<()> {
+        self.write(|registry| {
+            registry.get_mut(name)?.state = state;
+            Ok(())
+        })
+    }
+
+    /// Canonicalize `folder`, create it if needed, and refuse a path outside
+    /// the allowed root. The worker calls this. It does not write the registry.
+    pub fn resolve_folder(&self, folder: &Path) -> Result<PathBuf> {
+        prepare_folder(folder, &self.allowed_root)
+    }
+
+    /// Pack a plaintext folder. Does not write the registry.
+    pub fn pack_folder(&self, folder: &Path, passphrase: &[u8]) -> Result<()> {
+        check_passphrase(passphrase)?;
+        refuse_escaping_symlinks(folder)?;
+        let parent = parent_dir(folder)?;
+        let record = Record {
+            name: vault_name(folder)?,
+            path: folder.to_path_buf(),
+            state: State::Unlocked,
+        };
+        self.pack(&record, &parent, passphrase)
+    }
+
+    /// Extract an archive over `folder`. Does not write the registry.
+    pub fn unpack_folder(&self, folder: &Path, passphrase: &[u8]) -> Result<()> {
+        check_passphrase(passphrase)?;
+        let record = Record {
+            name: vault_name(folder)?,
+            path: folder.to_path_buf(),
+            state: State::Locked,
+        };
+        self.extract(&record, passphrase)
+    }
+
+    /// Test a locked archive, clear the immutable flag, and delete it.
+    pub fn remove_locked_archive(&self, folder: &Path, passphrase: &[u8]) -> Result<()> {
+        check_passphrase(passphrase)?;
+        self.test_archive(folder, passphrase)?;
+        self.mark_immutable(folder, false)?;
+        let archive = archive_for(folder);
+        if let Err(error) = fs::remove_file(&archive) {
+            let _ = self.mark_immutable(folder, true);
+            return Err(error.into());
+        }
+        if let Some(parent) = archive.parent() {
+            sync_dir(parent)?;
+        }
+        Ok(())
+    }
+
+    /// Ask the helper to set the immutable flag on the archive.
+    pub fn seal_archive(&self, folder: &Path) -> Result<()> {
+        self.mark_immutable(folder, true)
+    }
+
+    pub fn remove_plain_folder(&self, folder: &Path) -> Result<()> {
+        if folder.exists() {
+            fs::remove_dir_all(folder)?;
+        }
+        Ok(())
+    }
+
+    /// Delete staging, and delete the plaintext when both copies exist.
+    ///
+    /// The booleans describe what remains. The worker calls this. The helper
+    /// writes the registry from the result.
+    pub fn filename_facts(&self, folder: &Path) -> Result<FilenameFacts> {
+        let parent = parent_dir(folder)?;
+        let unlocking = parent.join(unlocking_file_name(folder)?);
+        let partial = parent.join(partial_file_name(folder)?);
+        if unlocking.symlink_metadata().is_ok() {
+            remove_path(&unlocking)?;
+        }
+        if partial.symlink_metadata().is_ok() {
+            remove_path(&partial)?;
+        }
+        let mut folder_exists = folder.is_dir();
+        let archive = archive_for(folder).is_file();
+        if folder_exists && archive {
+            fs::remove_dir_all(folder)?;
+            folder_exists = false;
+        }
+        sync_dir(&parent)?;
+        Ok(FilenameFacts {
+            folder: folder_exists,
+            archive,
+        })
+    }
+
+    /// The caller's uid when [`Self::for_user`] set one. Otherwise the owner of
+    /// the archive's parent directory, which is how startup reconcile knows
+    /// whose file it is putting the flag back on.
+    fn owner_uid(&self, parent: &Path) -> Result<u32> {
+        if let Some(user) = self.run_as {
+            return Ok(user.uid);
+        }
+        Ok(fs::metadata(parent)?.uid())
     }
 
     /// Remove the vault's bytes and its registry entry.
@@ -322,15 +790,26 @@ impl Vaults {
     /// place, and so is the registry entry.
     /// Unlocked or needs recovery: pass `None`. The plaintext folder is deleted.
     /// This crate does not hold the unlocked passphrase, so it cannot check one.
+    /// The registry entry is removed only after the bytes are gone.
     pub fn delete(&self, name: &str, passphrase: Option<&[u8]>) -> Result<()> {
-        let (_lock, mut registry) = self.locked()?;
-        let record = registry.get(name)?.clone();
+        self.delete_contents(name, passphrase)?;
+        self.unregister(name)
+    }
+
+    /// Delete the archive or the plaintext folder. The registry entry stays,
+    /// so a crash before [`Self::unregister`] still names the vault.
+    pub fn delete_contents(&self, name: &str, passphrase: Option<&[u8]>) -> Result<()> {
+        let record = self.read(|registry| Ok(registry.get(name)?.clone()))?;
         match (record.state, passphrase) {
             (State::Locked, Some(passphrase)) => {
                 check_passphrase(passphrase)?;
                 self.test_archive(&record.path, passphrase)?;
+                self.mark_immutable(&record.path, false)?;
                 let archive = archive_for(&record.path);
-                fs::remove_file(&archive)?;
+                if let Err(error) = fs::remove_file(&archive) {
+                    let _ = self.mark_immutable(&record.path, true);
+                    return Err(error.into());
+                }
                 if let Some(parent) = archive.parent() {
                     sync_dir(parent)?;
                 }
@@ -352,10 +831,22 @@ impl Vaults {
                     operation: "delete with a passphrase (nothing is held to check it against)",
                 })
             }
+            (State::Locking | State::Unlocking, _) => {
+                return Err(Error::InvalidState {
+                    state: record.state,
+                    operation: "delete",
+                })
+            }
         }
-        registry.remove(name)?;
-        registry.save()?;
         Ok(())
+    }
+
+    /// Drop the registry entry. The folder, archive, and bookmark stay.
+    pub fn unregister(&self, name: &str) -> Result<()> {
+        self.write(|registry| {
+            registry.remove(name)?;
+            Ok(())
+        })
     }
 
     fn test_archive(&self, vault: &Path, passphrase: &[u8]) -> Result<()> {
@@ -363,25 +854,62 @@ impl Vaults {
         let archive_name = file_name(&archive_for(vault))?;
         self.require_encrypted(&parent, &archive_name)?;
         let args = command_args("t", &archive_name, None);
-        run(&self.seven_zip, &args, &parent, passphrase)
+        run(&self.seven_zip, &args, &parent, passphrase, self.run_as)
     }
 
     /// `7z l` with stdin closed. Success means the archive is not encrypted,
     /// so a later test result is not used.
     fn require_encrypted(&self, parent: &Path, archive_name: &str) -> Result<()> {
         let args = command_args("l", archive_name, None);
-        match run_without_passphrase(&self.seven_zip, &args, parent) {
+        match run_without_passphrase(&self.seven_zip, &args, parent, self.run_as) {
             Ok(()) => Err(Error::NotEncrypted),
             Err(Error::SevenZip { .. } | Error::WrongPassphrase { .. }) => Ok(()),
             Err(error) => Err(error),
         }
     }
 
-    fn locked(&self) -> Result<(LockFile, Registry)> {
-        let lock = LockFile::acquire(&self.registry_dir)?;
+    /// Read `registry.json` while holding its `flock`. The lock is released
+    /// before this returns.
+    fn read<T>(&self, body: impl FnOnce(&Registry) -> Result<T>) -> Result<T> {
+        let _gate = self
+            .registry_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file = LockFile::acquire(&self.registry_dir)?;
         let registry = Registry::load(&self.registry_dir)?;
-        Ok((lock, registry))
+        body(&registry)
     }
+
+    /// Rewrite `registry.json` while holding its `flock`. The lock is released
+    /// before this returns. Callers run `7z` outside this function.
+    fn write<T>(&self, body: impl FnOnce(&mut Registry) -> Result<T>) -> Result<T> {
+        let _gate = self
+            .registry_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _file = LockFile::acquire(&self.registry_dir)?;
+        let mut registry = Registry::load(&self.registry_dir)?;
+        let value = body(&mut registry)?;
+        registry.save()?;
+        Ok(value)
+    }
+}
+
+fn record_flag(calls: &Mutex<Vec<FlagChange>>, set: bool) {
+    calls
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(if set {
+            FlagChange::Set
+        } else {
+            FlagChange::Clear
+        });
+}
+
+/// What remains of a vault after the worker's filename check.
+pub struct FilenameFacts {
+    pub folder: bool,
+    pub archive: bool,
 }
 
 impl From<&Record> for Vault {

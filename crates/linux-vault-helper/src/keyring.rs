@@ -1,0 +1,195 @@
+//! The helper's process keyring.
+//!
+//! One keyring for the process, shared by every thread. The thread keyring is
+//! not used: an async task can move threads and would lose the key. Each key
+//! is possessor-only and is not linked into the user or session keyring.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use linux_keyutils::{KeyPermissionsBuilder, KeyRing, KeyRingIdentifier, Permission};
+use zeroize::Zeroize;
+
+use crate::error::HelperError;
+use crate::pinentry::Passphrase;
+
+const PAYLOAD_CAP: usize = 4096;
+
+/// Passphrases for unlocked vaults, stored in the process keyring.
+///
+/// Cloning shares the same keys. This type cannot hand the bytes to a caller
+/// except [`Self::read`], which Lock uses and then [`Self::forget`] wipes.
+#[derive(Clone)]
+pub struct ProcessKeys {
+    prefix: Arc<str>,
+}
+
+impl ProcessKeys {
+    pub fn new() -> Result<Self, HelperError> {
+        process_ring()?;
+        static IDS: AtomicU64 = AtomicU64::new(0);
+        let prefix = format!(
+            "lve-{}-{}-",
+            std::process::id(),
+            IDS.fetch_add(1, Ordering::Relaxed)
+        );
+        Ok(Self {
+            prefix: Arc::from(prefix),
+        })
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.lookup(name).is_ok()
+    }
+
+    /// Copy the passphrase into the process keyring, then drop the userspace bytes.
+    pub fn insert(&self, name: &str, passphrase: Passphrase) -> Result<(), HelperError> {
+        let ring = process_ring()?;
+        let key = ring
+            .add_key(&self.description(name), passphrase.as_bytes())
+            .map_err(|error| named("storing passphrase", name, &error))?;
+        let perms = KeyPermissionsBuilder::builder()
+            .posessor(Permission::ALL)
+            .build();
+        if let Err(error) = key.set_perms(perms) {
+            let _ = key.invalidate();
+            return Err(named("storing passphrase", name, &error));
+        }
+        Ok(())
+    }
+
+    /// Read the passphrase back. The kernel copy stays until [`Self::forget`].
+    ///
+    /// Lock is the caller. Nothing on the bus reads this.
+    pub fn read(&self, name: &str) -> Result<Passphrase, HelperError> {
+        let key = self.lookup(name)?;
+        let mut buffer = [0u8; PAYLOAD_CAP];
+        let len = key
+            .read(&mut buffer)
+            .map_err(|error| named("reading passphrase", name, &error))?;
+        if len > buffer.len() {
+            buffer.zeroize();
+            return Err(HelperError::Failed(format!(
+                "reading passphrase for {name}: passphrase key is too long"
+            )));
+        }
+        let passphrase = Passphrase::from_bytes(&buffer[..len]);
+        buffer.zeroize();
+        Ok(passphrase)
+    }
+
+    /// Remove the key and let the kernel discard its payload.
+    ///
+    /// A key that is already gone or revoked is a success: its payload is wiped.
+    pub fn forget(&self, name: &str) -> Result<(), HelperError> {
+        let key = match self.lookup(name) {
+            Ok(key) => key,
+            Err(HelperError::Failed(message)) if already_gone(&message) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        match key.invalidate() {
+            Ok(()) => Ok(()),
+            Err(error) if already_gone(&error.to_string()) => Ok(()),
+            Err(error) => Err(named("forgetting passphrase", name, &error)),
+        }
+    }
+
+    fn lookup(&self, name: &str) -> Result<linux_keyutils::Key, HelperError> {
+        process_ring()?
+            .search(&self.description(name))
+            .map_err(|error| named("finding passphrase", name, &error))
+    }
+
+    fn description(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
+    }
+
+    #[cfg(test)]
+    fn absent_from_other_keyrings(&self, name: &str) -> bool {
+        let description = self.description(name);
+        [
+            KeyRingIdentifier::Thread,
+            KeyRingIdentifier::Session,
+            KeyRingIdentifier::User,
+            KeyRingIdentifier::UserSession,
+        ]
+        .into_iter()
+        .all(|id| match KeyRing::from_special_id(id, false) {
+            Ok(ring) => ring.search(&description).is_err(),
+            Err(_) => true,
+        })
+    }
+}
+
+fn process_ring() -> Result<KeyRing, HelperError> {
+    // Create the process keyring on first use. A fresh process does not have one.
+    KeyRing::from_special_id(KeyRingIdentifier::Process, true)
+        .map_err(|error| named("creating the process keyring", "helper", &error))
+}
+
+fn named(step: &str, target: &str, error: &dyn std::fmt::Display) -> HelperError {
+    HelperError::Failed(format!("{step} for {target}: {error}"))
+}
+
+fn already_gone(message: &str) -> bool {
+    message.contains("KeyDoesNotExist") || message.contains("KeyRevoked")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_passphrase_stays_on_the_process_keyring_and_is_wiped_at_lock() {
+        let keys = ProcessKeys::new().unwrap();
+        keys.insert("Forge", Passphrase::from_bytes(b"secret"))
+            .unwrap();
+        assert!(keys.contains("Forge"));
+        assert!(keys.absent_from_other_keyrings("Forge"));
+
+        let key = keys.lookup("Forge").unwrap();
+        let bits = key.metadata().unwrap().get_perms().bits();
+        assert_eq!(bits >> 24, u32::from(Permission::ALL.bits()));
+        assert_eq!(bits & 0x00ff_ffff, 0);
+
+        let keys_for_thread = keys.clone();
+        std::thread::spawn(move || {
+            let read = keys_for_thread.read("Forge").unwrap();
+            assert_eq!(read.as_bytes(), b"secret");
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(keys.read("Forge").unwrap().as_bytes(), b"secret");
+        keys.forget("Forge").unwrap();
+        assert!(!keys.contains("Forge"));
+        assert!(keys.read("Forge").is_err());
+        keys.forget("Forge").unwrap();
+    }
+
+    #[test]
+    fn a_fresh_process_creates_the_process_keyring() {
+        if std::env::var_os("LVE_FRESH_KEYRING").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "keyring::tests::a_fresh_process_creates_the_process_keyring",
+                    "--test-threads=1",
+                ])
+                .env("LVE_FRESH_KEYRING", "1")
+                .env("LVE_LIMITED_CAPS", "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "fresh keyring process failed: {status}");
+            return;
+        }
+        crate::limit_to_unit_capabilities();
+        let keys = ProcessKeys::new().unwrap();
+        keys.insert("lve-trial", Passphrase::from_bytes(b"secret"))
+            .unwrap();
+        assert_eq!(keys.read("lve-trial").unwrap().as_bytes(), b"secret");
+        keys.forget("lve-trial").unwrap();
+        let missing = keys.read("lve-trial").unwrap_err().to_string();
+        assert!(missing.contains("passphrase for lve-trial"), "{missing}");
+    }
+}

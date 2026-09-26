@@ -1,0 +1,22 @@
+[package]
+name = "linux-vault-lve"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "lve, the linux-vault command."
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "lve"
+path = "src/main.rs"
+
+[dependencies]
+linux-vault-dbus = { path = "../linux-vault-dbus" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+zbus = { version = "5", features = ["tokio", "p2p"] }
+
+[dev-dependencies]
+linux-vault = { path = "../linux-vault" }
+linux-vault-helper = { path = "../linux-vault-helper" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }

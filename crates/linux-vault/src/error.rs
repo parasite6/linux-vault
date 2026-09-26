@@ -22,6 +22,9 @@ pub enum Error {
     OutsideRoot,
     /// A symlink inside the vault points outside the vault.
     EscapingSymlink,
+    /// The archive is not a regular file owned by the caller, so its immutable
+    /// flag was left alone.
+    UnexpectedFile,
     /// `7z l` with no password succeeded, so the archive is not encrypted.
     /// Lock keeps the plaintext. Terminate deletes nothing.
     NotEncrypted,
@@ -54,6 +57,9 @@ impl fmt::Display for Error {
             Error::OutsideRoot => write!(f, "vault path is outside the allowed root"),
             Error::EscapingSymlink => {
                 write!(f, "symlink inside the vault points outside it")
+            }
+            Error::UnexpectedFile => {
+                write!(f, "archive is not a regular file owned by the caller")
             }
             Error::NotEncrypted => write!(f, "archive is not encrypted"),
             Error::InvalidState { state, operation } => {
