@@ -310,7 +310,7 @@ where
 }
 
 fn report<O: Write, E: Write>(stdout: &mut O, stderr: &mut E, json: bool, error: &zbus::Error) {
-    let message = error_text(error);
+    let message = spoken(error);
     let code = exit_for_error(error);
     if json {
         json_line(
@@ -318,14 +318,31 @@ fn report<O: Write, E: Write>(stdout: &mut O, stderr: &mut E, json: bool, error:
             &serde_json::json!({"event": "error", "exit": code, "message": message}),
         );
     }
-    let _ = writeln!(stderr, "lve: {message}");
+    let _ = writeln!(stderr, "{message}");
 }
 
-fn error_text(error: &zbus::Error) -> String {
-    match error {
-        zbus::Error::MethodError(_, Some(message), _) => message.clone(),
-        other => other.to_string(),
+/// What a person sees. Archive details stay in the journal, not here.
+fn spoken(error: &zbus::Error) -> String {
+    let (name, detail) = match error {
+        zbus::Error::MethodError(name, message, _) => {
+            (name.as_str(), message.clone().unwrap_or_default())
+        }
+        other => ("", other.to_string()),
+    };
+    if name.ends_with("WrongPassphrase") {
+        return "Wrong password.".into();
     }
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("not enough disk space") || lower.contains("no space left") {
+        return "Not enough disk space.".into();
+    }
+    if lower.contains("the archive is damaged") {
+        return "The archive is damaged.".into();
+    }
+    if lower.contains("the archive could not be read") {
+        return "The archive could not be read.".into();
+    }
+    format!("lve: {detail}")
 }
 
 fn exit_for_error(error: &zbus::Error) -> u8 {
@@ -349,6 +366,9 @@ fn exit_code_for(name: &str, message: &str) -> u8 {
     }
     if name.ends_with("NotFound") {
         return NOT_FOUND;
+    }
+    if name.ends_with("WrongPassphrase") {
+        return WRONG_PASSPHRASE;
     }
     let lower = message.to_ascii_lowercase();
     if lower.contains("wrong passphrase") {
@@ -397,6 +417,10 @@ mod exit_tests {
         assert_eq!(
             exit_code_for("org.linuxvault.Error.NotFound", "vault not found"),
             NOT_FOUND
+        );
+        assert_eq!(
+            exit_code_for("org.linuxvault.Error.WrongPassphrase", "wrong passphrase"),
+            WRONG_PASSPHRASE
         );
         assert_eq!(
             exit_code_for("org.linuxvault.Error.Failed", "wrong passphrase: no"),

@@ -597,6 +597,7 @@ impl Helper {
         .await
         .map_err(|error| failed("locking", name, error))?;
         if let Err(error) = packed {
+            let error = plain_archive_error(error);
             if error.to_string().contains("immutable") {
                 eprintln!("linux-vault-helper: locking for {name}: {error}");
             }
@@ -670,7 +671,8 @@ impl Helper {
             worker.unpack(&path, &bytes)
         })
         .await
-        .map_err(|error| failed("unlocking", name, error))??;
+        .map_err(|error| failed("unlocking", name, error))?
+        .map_err(plain_archive_error)?;
         self.vaults
             .set_state(account.uid, name, State::Unlocked)
             .map_err(|error| vault_error("unlocking", name, error))?;
@@ -787,7 +789,8 @@ impl Helper {
                 worker.unpack(&path, passphrase.as_bytes())
             })
             .await
-            .map_err(|error| failed("removing", name, error))??;
+            .map_err(|error| failed("removing", name, error))?
+            .map_err(plain_archive_error)?;
             self.vaults
                 .set_state(account.uid, name, State::Unlocked)
                 .map_err(|error| vault_error("removing", name, error))?;
@@ -861,7 +864,8 @@ impl Helper {
                     worker.delete_archive(&path, typed.as_bytes())
                 })
                 .await
-                .map_err(|error| failed("terminating", name, error))??;
+                .map_err(|error| failed("terminating", name, error))?
+                .map_err(plain_archive_error)?;
             }
             State::Unlocked => {
                 let held = match self.passphrases.read(account.uid, name) {
@@ -872,7 +876,7 @@ impl Helper {
                     Err(error) => return Err(error),
                 };
                 if !constant_time_eq(typed.as_bytes(), held.as_bytes()) {
-                    return Err(failed("terminating", name, "wrong passphrase"));
+                    return Err(HelperError::WrongPassphrase("wrong passphrase".into()));
                 }
                 let uid = account.uid;
                 let gid = account.gid;
@@ -1000,6 +1004,55 @@ fn failed(step: &str, target: &str, error: impl std::fmt::Display) -> HelperErro
 /// Missing and owned by someone else are the same error, with the same text.
 pub(crate) fn vault_not_found() -> HelperError {
     HelperError::NotFound("vault not found".into())
+}
+
+/// 7z's own text stays out of the error a caller can see. The full text is
+/// logged at debug priority for the journal. A `<7>` prefix is syslog debug.
+pub(crate) fn plain_archive_error(error: HelperError) -> HelperError {
+    let HelperError::Failed(message) = &error else {
+        return error;
+    };
+    let lower = message.to_ascii_lowercase();
+    let plain = if lower.contains("wrong password") || lower.contains("wrong passphrase") {
+        HelperError::WrongPassphrase("wrong passphrase".into())
+    } else if lower.contains("no space left")
+        || lower.contains("not enough space")
+        || lower.contains("disk full")
+        || lower.contains("os error 28")
+    {
+        HelperError::Failed("not enough disk space".into())
+    } else if lower.contains("data error")
+        || lower.contains("crc failed")
+        || lower.contains("headers error")
+        || lower.contains("is damaged")
+        || lower.contains("can not open the file as archive")
+    {
+        HelperError::Failed("the archive is damaged".into())
+    } else if lower.contains("7z failed") || lower.contains("7-zip") {
+        HelperError::Failed("the archive could not be read".into())
+    } else {
+        return error;
+    };
+    // Always written. systemd stores a `<7>` line at debug priority, with no
+    // RUST_LOG check. `journalctl -u linux-vault-helper -p debug` shows it.
+    journal_debug(message);
+    plain
+}
+
+fn journal_debug(text: &str) {
+    for line in debug_lines(text) {
+        eprintln!("{line}");
+    }
+}
+
+/// Every line carries the prefix. A later line without it is stored at the
+/// default priority and shows up in an ordinary journal read.
+fn debug_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.is_empty())
+        .map(|line| format!("<7>linux-vault-helper: {line}"))
+        .collect()
 }
 
 fn vault_error(step: &str, target: &str, error: linux_vault::Error) -> HelperError {
@@ -1168,6 +1221,52 @@ fn c_string(ptr: *const nix::libc::c_char) -> Result<String, HelperError> {
     text.to_str()
         .map(str::to_string)
         .map_err(|_| HelperError::NotAuthorized("passwd entry is not utf-8".into()))
+}
+
+#[cfg(test)]
+mod archive_errors {
+    use super::{plain_archive_error, HelperError};
+    use zbus::DBusError;
+
+    #[test]
+    fn seven_zip_text_becomes_a_short_error() {
+        let wrong = plain_archive_error(HelperError::Failed(
+            "unlocking for /home/me/Forge: wrong passphrase: ERROR: Wrong password : Forge.7z\n7-Zip banner".into(),
+        ));
+        assert_eq!(
+            wrong.name().as_str(),
+            "org.linuxvault.Error.WrongPassphrase"
+        );
+        assert_eq!(wrong.description(), Some("wrong passphrase"));
+        assert!(!wrong.to_string().contains("7-Zip"));
+        assert!(!wrong.to_string().contains("Forge.7z"));
+
+        let space = plain_archive_error(HelperError::Failed(
+            "7z failed (status Some(2)): No space left on device".into(),
+        ));
+        assert_eq!(space.description(), Some("not enough disk space"));
+
+        let damaged = plain_archive_error(HelperError::Failed(
+            "7z failed (status Some(2)): ERROR: Data Error : Forge.7z".into(),
+        ));
+        assert_eq!(damaged.description(), Some("the archive is damaged"));
+        assert!(!damaged.to_string().contains("Forge.7z"));
+    }
+
+    #[test]
+    fn every_detail_line_is_debug_priority() {
+        let lines = super::debug_lines(
+            "7-Zip 26.02\nERROR: Wrong password : Forge.7z\n\nHeaders Error\r\n",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "<7>linux-vault-helper: 7-Zip 26.02".to_string(),
+                "<7>linux-vault-helper: ERROR: Wrong password : Forge.7z".to_string(),
+                "<7>linux-vault-helper: Headers Error".to_string(),
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

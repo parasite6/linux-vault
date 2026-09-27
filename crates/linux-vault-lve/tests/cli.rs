@@ -41,7 +41,7 @@ for raw in sys.stdin:
         continue
     if mode == "cancel":
         say("ERR 83886179 Operation cancelled")
-    elif mode == "wrong" or (mode == "terminate-wrong" and "Terminate" in description):
+    elif mode == "wrong" or (mode == "unlock-wrong" and "Unlock" in description) or (mode == "terminate-wrong" and "Terminate" in description):
         say("D wrong")
         say("OK")
     else:
@@ -245,8 +245,10 @@ async fn an_open_file_a_wrong_passphrase_and_a_denial_have_their_own_codes() {
     invoke(&wrong, &["create", folder.to_str().unwrap()]).await;
     fs::write(folder.join("note.txt"), b"hello\n").unwrap();
     invoke(&wrong, &["lock", "Forge"]).await;
-    let (code, _out, err) = invoke(&wrong, &["terminate", "Forge"]).await;
+    let (code, out, err) = invoke(&wrong, &["terminate", "Forge"]).await;
     assert_eq!(code, WRONG_PASSPHRASE, "{err}");
+    assert_eq!(err, "Wrong password.\n");
+    assert!(!format!("{out}{err}").contains("7-Zip"), "{out}{err}");
 
     let denied = session("secret", Authorizer::Deny).await;
     let (code, _out, err) = invoke(&denied, &["ls"]).await;
@@ -262,6 +264,26 @@ async fn a_vault_removed_before_the_write_is_not_found() {
     let (code, _out, err) = invoke(&session, &["lock", "Forge"]).await;
     assert_eq!(code, NOT_FOUND, "{err}");
     assert!(err.contains("vault not found"), "{err}");
+}
+
+#[tokio::test]
+async fn a_wrong_passphrase_says_only_wrong_password() {
+    let session = session("unlock-wrong", Authorizer::Allow).await;
+    let folder = session.dir.path.join("Forge");
+    let (code, _out, err) = invoke(&session, &["create", folder.to_str().unwrap()]).await;
+    assert_eq!(code, OK, "{err}");
+    fs::write(folder.join("note.txt"), b"hello\n").unwrap();
+    let (code, _out, err) = invoke(&session, &["lock", "Forge"]).await;
+    assert_eq!(code, OK, "{err}");
+    let (code, out, err) = invoke(&session, &["unlock", "Forge"]).await;
+    assert_eq!(code, WRONG_PASSPHRASE, "{err} {out}");
+    assert_eq!(err, "Wrong password.\n");
+    let shown = format!("{out}{err}");
+    assert!(!shown.contains("7-Zip"), "{shown}");
+    assert!(!shown.contains("7z"), "{shown}");
+    assert!(!shown.contains("ERROR"), "{shown}");
+    assert!(session.dir.path.join("Forge.7z").is_file());
+    assert!(!folder.exists());
 }
 
 #[tokio::test]

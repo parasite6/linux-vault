@@ -11,6 +11,12 @@ Type=dbus
 BusName=org.linuxvault.Helper
 ExecStart=/usr/libexec/linux-vault-helper
 Restart=on-failure
+# stderr is the journal. A `<7>` prefix is syslog debug, on every line, and
+# is written whether or not RUST_LOG is set. Read it with
+# journalctl -u linux-vault-helper -p debug
+StandardOutput=journal
+StandardError=journal
+SyslogLevelPrefix=yes
 # logind waits InhibitDelayMaxSec=120. The default of 90 seconds would
 # SIGKILL a lock that logind was still waiting for.
 TimeoutStopSec=120

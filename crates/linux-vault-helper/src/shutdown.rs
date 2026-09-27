@@ -408,7 +408,7 @@ impl ShutdownHandle {
                         eprintln!("linux-vault-helper: locking for {name}: {error}");
                     }
                 }
-                return packed;
+                return packed.map_err(crate::plain_archive_error);
             }
             vaults
                 .set_state(uid, &name, State::Locked)

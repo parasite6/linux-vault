@@ -17,6 +17,8 @@ pub enum HelperError {
     Cancelled(String),
     /// The caller's user manager is not running.
     NotLoggedIn(String),
+    /// The passphrase did not match. The message is only `wrong passphrase`.
+    WrongPassphrase(String),
     /// Pinentry or the vault operation failed. The message has no passphrase.
     Failed(String),
 }

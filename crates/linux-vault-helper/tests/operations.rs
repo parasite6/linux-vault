@@ -277,8 +277,14 @@ async fn a_wrong_passphrase_leaves_the_archive_locked() {
     vaults.lock("Forge", b"secret").unwrap();
 
     let proxy = proxy(&session.client).await;
-    let error = proxy.unlock("Forge").await.unwrap_err();
-    assert!(error.to_string().contains("wrong passphrase"), "{error}");
+    let error = proxy.unlock("Forge").await.unwrap_err().to_string();
+    assert!(
+        error.contains("org.linuxvault.Error.WrongPassphrase"),
+        "{error}"
+    );
+    assert!(error.contains("wrong passphrase"), "{error}");
+    assert!(!error.contains("7-Zip"), "{error}");
+    assert!(!error.contains("7z"), "{error}");
     assert!(session.dir.path.join("Forge.7z").is_file());
     assert!(!folder.exists());
     assert!(!session.held.contains(caller_uid(), "Forge"));

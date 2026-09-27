@@ -81,7 +81,7 @@ The archive is AES-256 with filenames encrypted and no compression (`-mx=0`). 7z
 | 0    | success                                                      |
 | 1    | other failure                                                |
 | 2    | usage                                                        |
-| 3    | wrong passphrase                                             |
+| 3    | wrong passphrase. The terminal says `Wrong password.`        |
 | 4    | busy (the registry, or a vault that is locking or unlocking) |
 | 5    | a file in the vault is open                                  |
 | 6    | needs recovery                                               |
@@ -91,7 +91,7 @@ The archive is AES-256 with filenames encrypted and no compression (`-mx=0`). 7z
 | 10   | prompt cancelled                                             |
 | 11   | vault not found                                              |
 
-Exit 11 is `org.linuxvault.Error.NotFound`. A missing name and another user's name are that same error.
+Exit 11 is `org.linuxvault.Error.NotFound`. A missing name and another user's name are that same error. A wrong passphrase is `org.linuxvault.Error.WrongPassphrase` with the message `wrong passphrase`. The terminal prints `Wrong password.` and nothing from 7z. The helper always logs 7z's own text to the journal at debug priority, one `<7>` prefix per line, whether or not `RUST_LOG` is set. Read it with `journalctl -u linux-vault-helper -p debug`. A full disk prints `Not enough disk space.` A damaged archive prints `The archive is damaged.`
 
 ## Build
 
