@@ -498,12 +498,24 @@ fn finish_round_trip(
         println!("   probe {}: {}", probe.label, yes_no(ok));
     }
 
+    let mut wrong_candidate = format!(
+        "wrong-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+    .into_bytes();
+    while wrong_candidate.as_slice() == intended {
+        wrong_candidate.push(b'x');
+    }
+
     let wrong = !open_with_password(
         bin,
         work,
         archive,
         case,
-        b"definitely-wrong",
+        wrong_candidate.as_slice(),
         OpenKind::Test,
     );
     outcome.wrong_fails = Some(wrong);
