@@ -1,4 +1,6 @@
-# linux-vault
+<img width="1152" height="768" alt="logolve" src="https://github.com/user-attachments/assets/80716337-2109-40b0-b4c0-cd4b08018a53" />
+
+# Linux-Vault
 
 linux-vault locks a folder in your home. While a vault is unlocked it is an ordinary folder. Lock packs that folder into one encrypted 7z archive beside it, with filenames encrypted, and marks the archive immutable. Unlock asks for the passphrase once, clears the immutable flag, and extracts the folder again.
 
