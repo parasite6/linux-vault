@@ -38,6 +38,8 @@ const FACTS: u8 = 12;
 const SEAL: u8 = 14;
 const SCAN: u8 = 15;
 const OWNER: u8 = 16;
+const ADD_BOOKMARK: u8 = 17;
+const CONTENTS: u8 = 18;
 const MAX_BODY: usize = 1024 * 1024;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -175,7 +177,7 @@ fn serve(mut sock: UnixStream) -> Result<(), String> {
                 }
             }
         };
-        let result = dispatch(&vaults, tag, &body);
+        let result = dispatch(&vaults, &home, tag, &body);
         let mut guard = sock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Err(error) =
             result.and_then(|reply| write_frame(&mut guard, reply.0, &reply.1, None))
@@ -190,7 +192,7 @@ fn serve(mut sock: UnixStream) -> Result<(), String> {
     Ok(())
 }
 
-fn dispatch(vaults: &Vaults, tag: u8, body: &[u8]) -> std::io::Result<(u8, Vec<u8>)> {
+fn dispatch(vaults: &Vaults, home: &Path, tag: u8, body: &[u8]) -> std::io::Result<(u8, Vec<u8>)> {
     let run = || -> Result<(u8, Vec<u8>), String> {
         match tag {
             RESOLVE => {
@@ -245,8 +247,20 @@ fn dispatch(vaults: &Vaults, tag: u8, body: &[u8]) -> std::io::Result<(u8, Vec<u
                 let path = std::str::from_utf8(body).map_err(|error| {
                     format!("removing the bookmark for worker command: {error}")
                 })?;
-                crate::bookmarks::remove_along(Path::new(path))
+                crate::bookmarks::remove(home, Path::new(path))
                     .map_err(|error| format!("removing the bookmark for {path}: {error}"))?;
+                Ok((OK, Vec::new()))
+            }
+            ADD_BOOKMARK => {
+                let split = body.iter().position(|byte| *byte == 0).ok_or_else(|| {
+                    "writing the bookmark for worker command: missing a vault name".to_string()
+                })?;
+                let path = std::str::from_utf8(&body[..split])
+                    .map_err(|error| format!("writing the bookmark for worker command: {error}"))?;
+                let name = std::str::from_utf8(&body[split + 1..])
+                    .map_err(|error| format!("writing the bookmark for {path}: {error}"))?;
+                crate::bookmarks::ensure(home, Path::new(path), name)
+                    .map_err(|error| format!("writing the bookmark for {name}: {error}"))?;
                 Ok((OK, Vec::new()))
             }
             SEAL => {
@@ -262,6 +276,12 @@ fn dispatch(vaults: &Vaults, tag: u8, body: &[u8]) -> std::io::Result<(u8, Vec<u
                     .map_err(|error| format!("reading the owner for worker command: {error}"))?;
                 let uid = owner_of(Path::new(path))?;
                 Ok((OK, uid.to_le_bytes().to_vec()))
+            }
+            CONTENTS => {
+                let path = std::str::from_utf8(body)
+                    .map_err(|error| format!("reading the vault for worker command: {error}"))?;
+                let present = has_regular_file(Path::new(path))?;
+                Ok((OK, vec![u8::from(present)]))
             }
             SCAN => {
                 let split = body.iter().position(|byte| *byte == 0).ok_or_else(|| {
@@ -341,6 +361,29 @@ fn owner_of(vault: &Path) -> Result<u32, String> {
     Err(format!("cannot see the owner of {}", vault.display()))
 }
 
+/// A regular file at any depth. Directories and symlinks do not count, and
+/// directory symlinks are not followed.
+fn has_regular_file(root: &Path) -> Result<bool, String> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|error| format!("reading {}: {error}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("reading {}: {error}", dir.display()))?;
+            let kind = entry
+                .file_type()
+                .map_err(|error| format!("reading {}: {error}", entry.path().display()))?;
+            if kind.is_file() {
+                return Ok(true);
+            }
+            if kind.is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn uid_of(path: &Path) -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     std::fs::symlink_metadata(path).ok().map(|meta| meta.uid())
@@ -393,7 +436,11 @@ impl HomeWorker {
             .arg("--worker")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            // The home comes from the passwd entry, passed in the handshake.
+            // HOME and XDG_CONFIG_HOME must not choose the bookmarks file.
+            .env_remove("HOME")
+            .env_remove("XDG_CONFIG_HOME");
         unsafe {
             command.pre_exec(move || {
                 pinentry::drop_to(uid, gid)?;
@@ -507,10 +554,27 @@ impl HomeWorker {
         }
     }
 
+    pub fn add_bookmark(&mut self, path: &Path, name: &str) -> Result<(), HelperError> {
+        let mut body = path_bytes(path);
+        body.push(0);
+        body.extend(name.as_bytes());
+        self.roundtrip(ADD_BOOKMARK, &body)
+            .map(|_| ())
+            .map_err(|error| step_error("writing the bookmark", path, error))
+    }
+
     pub fn remove_bookmark(&mut self, path: &Path) -> Result<(), HelperError> {
         self.roundtrip(BOOKMARK, &path_bytes(path))
             .map(|_| ())
             .map_err(|error| step_error("removing the bookmark", path, error))
+    }
+
+    /// `true` when `path` contains a regular file at any depth.
+    pub fn contains_regular_file(&mut self, path: &Path) -> Result<bool, HelperError> {
+        let body = self
+            .roundtrip(CONTENTS, &path_bytes(path))
+            .map_err(|error| step_error("reading", path, error))?;
+        Ok(body.first().copied() == Some(1))
     }
 
     pub fn scan_open_files(&mut self, name: &str, path: &Path) -> Result<(), HelperError> {

@@ -8,24 +8,42 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-/// Arguments for archive, test, extract, and list. The passphrase is not here.
+/// Arguments for test, extract, and list. The passphrase is not here.
 ///
-/// Create passes bare `-p`, which makes 7z encrypt and read the passphrase
-/// from stdin. Test, extract, and list omit `-p`: on 7-Zip 26.02 a bare `-p`
-/// is an empty password, and 7z then does not read stdin. An encrypted archive
-/// makes test and extract ask on their own, and that prompt reads stdin.
-/// `output_dir` is the `-o` directory for extract.
+/// These verbs omit `-p`. On 7-Zip 26.02 a bare `-p` is an empty password, and
+/// 7z then does not read stdin. An encrypted archive makes test and extract
+/// ask on their own, and that prompt reads stdin. `output_dir` is the `-o`
+/// directory for extract.
 pub fn command_args(verb: &str, archive_name: &str, output_dir: Option<&str>) -> Vec<String> {
     let mut args = vec![verb.to_string()];
-    if verb == "a" {
-        args.extend(["-p", "-mhe=on", "-mx=0"].map(str::to_string));
-    }
     args.extend(["-y", "-bd"].map(str::to_string));
     if let Some(dir) = output_dir {
         args.push(format!("-o{dir}"));
     }
     args.extend(["--", archive_name].map(str::to_string));
     args
+}
+
+/// Arguments for `7z a`. `-p` and `-mhe=on` are always present, as their own
+/// arguments. The passphrase is required so this cannot build a lock command
+/// without one, and it is not placed in the argument list. `7z` reads it
+/// from stdin.
+pub fn add_command(archive_name: &str, passphrase: &[u8]) -> Result<Vec<String>> {
+    if passphrase.is_empty()
+        || passphrase.contains(&0)
+        || passphrase.contains(&b'\n')
+        || passphrase.contains(&b'\r')
+    {
+        return Err(Error::InvalidPassphrase("missing"));
+    }
+    let mut args = vec![
+        "a".to_string(),
+        "-p".to_string(),
+        "-mhe=on".to_string(),
+        "-mx=0".to_string(),
+    ];
+    args.extend(command_args("a", archive_name, None).into_iter().skip(1));
+    Ok(args)
 }
 
 pub fn run(
@@ -98,6 +116,7 @@ fn spawn(
     cwd: &Path,
     user: Option<Credentials>,
 ) -> Result<std::process::Child> {
+    log_args(args);
     let mut command = Command::new(seven_zip);
     command
         .args(args)
@@ -270,6 +289,11 @@ fn read_capped(mut pipe: impl std::io::Read) -> Vec<u8> {
         }
     }
     buf
+}
+
+/// Debug priority, one line. The passphrase is not among `args`.
+fn log_args(args: &[String]) {
+    eprintln!("<7>linux-vault-helper: 7z {}", args.join(" "));
 }
 
 fn is_wrong_passphrase(message: &str) -> bool {

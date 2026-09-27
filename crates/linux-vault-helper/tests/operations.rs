@@ -505,6 +505,140 @@ async fn lock_without_a_held_passphrase_asks_twice_and_forgets_it() {
     );
 }
 
+fn list_without_password(archive: &Path) -> bool {
+    std::process::Command::new("7z")
+        .args(["l", "-y", "-bd", "--"])
+        .arg(archive.file_name().unwrap())
+        .current_dir(archive.parent().unwrap())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[tokio::test]
+async fn a_held_lock_and_a_recovery_lock_are_both_encrypted() {
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let folder = session.dir.path.join("Forge");
+    proxy.create(folder.to_str().unwrap()).await.unwrap();
+    fs::write(folder.join("note.txt"), b"hello\n").unwrap();
+    proxy.lock("Forge").await.unwrap();
+    let archive = session.dir.path.join("Forge.7z");
+    assert!(archive.is_file());
+    assert!(
+        !list_without_password(&archive),
+        "held lock left an archive that opens with no password"
+    );
+
+    proxy.unlock("Forge").await.unwrap();
+    session.held.forget(caller_uid(), "Forge").unwrap();
+    let vaults = Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap();
+    vaults
+        .set_state(caller_uid(), "Forge", linux_vault::State::NeedsRecovery)
+        .unwrap();
+    proxy.lock("Forge").await.unwrap();
+    assert!(archive.is_file());
+    assert!(
+        !list_without_password(&archive),
+        "recovery lock left an archive that opens with no password"
+    );
+    assert!(!folder.exists());
+}
+
+#[tokio::test]
+async fn an_empty_folder_is_not_locked() {
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let folder = session.dir.path.join("Forge");
+    proxy.create(folder.to_str().unwrap()).await.unwrap();
+
+    let error = proxy.lock("Forge").await.unwrap_err().to_string();
+    assert!(error.contains("org.linuxvault.Error.Empty"), "{error}");
+    assert!(
+        error.contains("Forge is empty; nothing to lock."),
+        "{error}"
+    );
+    assert!(folder.is_dir());
+    assert!(!session.dir.path.join("Forge.7z").exists());
+    assert!(session.held.contains(caller_uid(), "Forge"));
+    let vaults = Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap();
+    assert_eq!(
+        vaults.get("Forge").unwrap().state,
+        linux_vault::State::Unlocked
+    );
+}
+
+#[tokio::test]
+async fn a_folder_of_empty_subfolders_is_not_locked() {
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let folder = session.dir.path.join("Forge");
+    proxy.create(folder.to_str().unwrap()).await.unwrap();
+    fs::create_dir_all(folder.join("nested").join("deeper")).unwrap();
+
+    let error = proxy.lock("Forge").await.unwrap_err().to_string();
+    assert!(error.contains("org.linuxvault.Error.Empty"), "{error}");
+    assert!(folder.join("nested").join("deeper").is_dir());
+    assert!(!session.dir.path.join("Forge.7z").exists());
+    let vaults = Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap();
+    assert_eq!(
+        vaults.get("Forge").unwrap().state,
+        linux_vault::State::Unlocked
+    );
+}
+
+#[tokio::test]
+async fn recovery_of_an_empty_vault_does_not_prompt() {
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let folder = session.dir.path.join("Forge");
+    proxy.create(folder.to_str().unwrap()).await.unwrap();
+    session.held.forget(caller_uid(), "Forge").unwrap();
+    let vaults = Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap();
+    vaults
+        .set_state(caller_uid(), "Forge", linux_vault::State::NeedsRecovery)
+        .unwrap();
+    let before = fs::read_to_string(&session.log).unwrap_or_default();
+
+    let error = proxy.lock("Forge").await.unwrap_err().to_string();
+    assert!(error.contains("org.linuxvault.Error.Empty"), "{error}");
+    let transcript = fs::read_to_string(&session.log).unwrap_or_default();
+    let added = transcript.get(before.len()..).unwrap_or(&transcript);
+    assert!(
+        !added.contains("GETPIN"),
+        "recovery prompted for an empty vault: {added}"
+    );
+    assert!(folder.is_dir());
+    assert!(!session.dir.path.join("Forge.7z").exists());
+    let vaults = Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap();
+    assert_eq!(
+        vaults.get("Forge").unwrap().state,
+        linux_vault::State::NeedsRecovery
+    );
+}
+
+#[tokio::test]
+async fn shutdown_leaves_an_empty_unlocked_vault_alone() {
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let folder = session.dir.path.join("Forge");
+    proxy.create(folder.to_str().unwrap()).await.unwrap();
+
+    session.shutdown.shut_down().await;
+    assert_eq!(session.shutdown.lock_attempts(), 0);
+    assert!(folder.is_dir());
+    assert!(!session.dir.path.join("Forge.7z").exists());
+    assert!(session.held.contains(caller_uid(), "Forge"));
+    let vaults = Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap();
+    assert_eq!(
+        vaults.get("Forge").unwrap().state,
+        linux_vault::State::Unlocked
+    );
+}
+
 #[tokio::test]
 async fn recovery_without_a_repeated_passphrase_leaves_the_folder() {
     let session = session("wrong").await;
@@ -573,6 +707,32 @@ async fn remove_of_an_unlocked_vault_drops_the_registry_entry_and_the_key() {
     assert!(vaults.get("Forge").is_err());
     let text = fs::read_to_string(bookmarks.join("bookmarks")).unwrap();
     assert!(text.contains("Forge"), "{text}");
+}
+
+#[tokio::test]
+async fn a_bookmark_is_added_without_home_and_kept_across_lock_and_unlock() {
+    let session = session("secret").await;
+    fs::set_permissions(&session.dir.path, fs::Permissions::from_mode(0o700)).unwrap();
+    let proxy = proxy(&session.client).await;
+    let folder = session.dir.path.join("My Vault");
+    proxy.create(folder.to_str().unwrap()).await.unwrap();
+    let marks = session.dir.path.join(".config/gtk-3.0/bookmarks");
+    let canonical = folder.canonicalize().unwrap();
+    let encoded = canonical.display().to_string().replace(' ', "%20");
+    let line = format!("file://{encoded} My Vault\n");
+    assert_eq!(fs::read_to_string(&marks).unwrap(), line);
+
+    fs::remove_file(&marks).unwrap();
+    fs::write(folder.join("note.txt"), b"hello\n").unwrap();
+    proxy.lock("My Vault").await.unwrap();
+    assert_eq!(fs::read_to_string(&marks).unwrap(), line);
+
+    fs::remove_file(&marks).unwrap();
+    proxy.unlock("My Vault").await.unwrap();
+    assert_eq!(fs::read_to_string(&marks).unwrap(), line);
+
+    proxy.remove("My Vault").await.unwrap();
+    assert_eq!(fs::read_to_string(&marks).unwrap(), line);
 }
 
 #[tokio::test]
@@ -765,6 +925,203 @@ async fn a_second_shutdown_finds_the_vault_already_locked() {
         vaults.get("Forge").unwrap().state,
         linux_vault::State::Locked
     );
+}
+
+#[test]
+fn systemctl_stop_locks_an_unlocked_vault() {
+    if std::env::var_os("LVE_STOP_CHILD").is_some() {
+        stop_child();
+        return;
+    }
+    let stamp = format!("{}-{}", std::process::id(), std::process::id());
+    let ready = PathBuf::from(format!("/var/tmp/lve-cursor-tests/stop-ready-{stamp}"));
+    let result = PathBuf::from(format!("/var/tmp/lve-cursor-tests/stop-result-{stamp}"));
+    let _ = std::fs::remove_file(&ready);
+    let _ = std::fs::remove_file(&result);
+    let unit = format!("lve-stop-{stamp}");
+    let helper = std::env::var_os("CARGO_BIN_EXE_linux_vault_helper");
+    let mut command = std::process::Command::new("systemd-run");
+    command
+        .args(["--user", "--collect", "--unit", &unit])
+        .args([
+            "-p",
+            "TimeoutStopSec=30",
+            "-p",
+            "KillMode=control-group",
+            "-p",
+            "KeyringMode=private",
+        ])
+        .arg("--setenv=LVE_STOP_CHILD=1")
+        .arg(format!("--setenv=LVE_STOP_READY={}", ready.display()))
+        .arg(format!("--setenv=LVE_STOP_RESULT={}", result.display()))
+        .arg("--setenv=TMPDIR=/var/tmp/lve-cursor-tests")
+        .arg(format!(
+            "--setenv=PATH={}",
+            std::env::var("PATH").unwrap_or_else(|_| "/usr/bin".into())
+        ));
+    if let Some(path) = helper {
+        command.arg(format!(
+            "--setenv=LVE_HELPER_BIN={}",
+            path.to_string_lossy()
+        ));
+    }
+    let status = command
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "systemctl_stop_locks_an_unlocked_vault",
+            "--test-threads=1",
+            "--nocapture",
+        ])
+        .status()
+        .expect("systemd-run");
+    assert!(status.success(), "systemd-run failed: {status}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ready.is_file() {
+        if std::time::Instant::now() >= deadline {
+            panic!("stop child did not become ready");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let stopped = std::process::Command::new("systemctl")
+        .args(["--user", "stop", &unit])
+        .status()
+        .expect("systemctl stop");
+    assert!(stopped.success(), "systemctl stop failed: {stopped}");
+    let text = fs::read_to_string(&result).unwrap_or_default();
+    assert_eq!(text, "ok\n", "stop child result: {text:?}");
+}
+
+struct Logind;
+
+#[zbus::interface(name = "org.freedesktop.login1.Manager")]
+impl Logind {
+    async fn inhibit(
+        &self,
+        _what: &str,
+        _who: &str,
+        _why: &str,
+        _mode: &str,
+    ) -> zbus::fdo::Result<zbus::zvariant::OwnedFd> {
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let owned: std::os::fd::OwnedFd = file.into();
+        Ok(owned.into())
+    }
+}
+
+fn stop_child() {
+    let ready = std::env::var("LVE_STOP_READY").unwrap();
+    let result = std::env::var("LVE_STOP_RESULT").unwrap();
+    // Same order as the service: the ring exists before any runtime thread.
+    linux_vault_helper::create_process_keyring().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let session = session("secret").await;
+        let proxy = proxy(&session.client).await;
+        let folder = session.dir.path.join("Forge");
+        proxy.create(folder.to_str().unwrap()).await.unwrap();
+        fs::write(folder.join("note.txt"), b"hello\n").unwrap();
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+        fs::write(&ready, b"ready\n").unwrap();
+        terminate.recv().await;
+        session.shutdown.shut_down().await;
+        let archive = session.dir.path.join("Forge.7z");
+        assert!(archive.is_file(), "SIGTERM did not leave an archive");
+        assert!(
+            !list_without_password(&archive),
+            "archive opens with no password"
+        );
+        let flags = session.flags.as_ref().unwrap().calls();
+        assert!(
+            flags.iter().any(|call| matches!(call, FlagChange::Set)),
+            "immutable flag was not set: {flags:?}"
+        );
+        let (stored_on, read_on) = linux_vault_helper::passphrase_threads();
+        assert_ne!(stored_on, 0, "create did not store a passphrase");
+        assert_ne!(read_on, 0, "SIGTERM shutdown did not read the passphrase");
+        assert_ne!(
+            stored_on, read_on,
+            "the store and the SIGTERM read ran on the same thread"
+        );
+        fs::write(&result, b"ok\n").unwrap();
+    });
+}
+
+#[tokio::test]
+async fn prepare_for_shutdown_on_the_bus_locks_the_vault() {
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let folder = session.dir.path.join("Forge");
+    proxy.create(folder.to_str().unwrap()).await.unwrap();
+    fs::write(folder.join("note.txt"), b"hello\n").unwrap();
+
+    let mut daemon = std::process::Command::new("dbus-daemon")
+        .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("dbus-daemon");
+    let mut address = String::new();
+    std::io::BufRead::read_line(
+        &mut std::io::BufReader::new(daemon.stdout.take().unwrap()),
+        &mut address,
+    )
+    .unwrap();
+    let address = address.trim();
+    assert!(!address.is_empty(), "dbus-daemon did not print an address");
+    let owner = zbus::connection::Builder::address(address)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    owner
+        .object_server()
+        .at("/org/freedesktop/login1", Logind)
+        .await
+        .unwrap();
+    owner.request_name("org.freedesktop.login1").await.unwrap();
+    let helper_bus = zbus::connection::Builder::address(address)
+        .unwrap()
+        .build()
+        .await
+        .unwrap();
+    session.shutdown.bind_bus(helper_bus).await;
+    let watch = session.shutdown.clone();
+    let watching = tokio::spawn(async move { watch.watch_prepare_for_shutdown().await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let signal = zbus::message::Message::signal(
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+        "PrepareForShutdown",
+    )
+    .unwrap()
+    .build(&(true,))
+    .unwrap();
+    owner.send(&signal).await.unwrap();
+
+    let archive = session.dir.path.join("Forge.7z");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !archive.is_file() {
+        if std::time::Instant::now() >= deadline {
+            panic!("PrepareForShutdown did not lock the vault");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(!list_without_password(&archive));
+    let flags = session.flags.as_ref().unwrap().calls();
+    assert!(
+        flags.iter().any(|call| matches!(call, FlagChange::Set)),
+        "{flags:?}"
+    );
+    watching.abort();
+    let _ = daemon.kill();
+    let _ = daemon.wait();
 }
 
 #[tokio::test]

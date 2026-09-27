@@ -19,6 +19,8 @@ pub enum HelperError {
     NotLoggedIn(String),
     /// The passphrase did not match. The message is only `wrong passphrase`.
     WrongPassphrase(String),
+    /// The folder has no regular files. The message names the vault.
+    Empty(String),
     /// Pinentry or the vault operation failed. The message has no passphrase.
     Failed(String),
 }

@@ -17,6 +17,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     if std::env::args().nth(1).as_deref() == Some("--worker") {
         std::process::exit(linux_vault_helper::worker_main());
     }
+    // Before any runtime thread exists. Later threads inherit this ring.
+    // Creating it afterwards gives each of those threads an empty ring.
+    linux_vault_helper::create_process_keyring()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -40,6 +43,9 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     });
     let mut terminate = signal(SignalKind::terminate())?;
     terminate.recv().await;
+    // Info priority, flushed before the lock work. A stop that dies in the
+    // handler never reaches this line.
+    linux_vault_helper::stop_log("received SIGTERM");
     shutdown.shut_down().await;
     Ok(())
 }

@@ -2,7 +2,7 @@
 %global debug_package %{nil}
 
 Name:           linux-vault
-Version:        0.1.0
+Version:        0.1.4
 Release:        1%{?dist}
 Summary:        Lock a folder in your home
 
@@ -68,5 +68,13 @@ install -D -m 0644 packaging/systemd/logind.conf.d/linux-vault.conf %{buildroot}
 %{_prefix}/lib/systemd/logind.conf.d/linux-vault.conf
 
 %changelog
+* Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.4-1
+- Lock held vaults on stop. The passphrase was invisible to the thread that handled SIGTERM.
+* Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.3-1
+- Refuse to lock a vault that contains no files.
+* Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.2-1
+- Encrypt a recovery lock with the passphrase that was just typed.
+* Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.1-1
+- Isolate vaults by uid, report another user's name as not found, and keep bookmarks.
 * Sat Sep 26 2026 parasite6 <myworkforstore@proton.me> - 0.1.0-1
 - Package the helper, lve, and the shutdown and ptrace settings.

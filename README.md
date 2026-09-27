@@ -13,7 +13,7 @@ v1 is this command and that helper. It is for regular Fedora, where home is `/ho
 The package is `linux-vault`. It depends on `7zip` and `pinentry-qt`.
 
 ```bash
-sudo dnf install linux-vault-0.1.0-1.fc44.x86_64.rpm
+sudo dnf install linux-vault-0.1.4-1.fc44.x86_64.rpm
 ```
 
 That installs `lve`, the helper at `/usr/libexec/linux-vault-helper`, and the systemd unit `linux-vault-helper.service`. The unit starts on the system bus as `org.linuxvault.Helper`. An upgrade does not restart the helper, so a `dnf upgrade` does not drop passphrases that are still held. The new helper takes effect at the next boot, or when you restart the service yourself. A restart locks every vault that is still unlocked.
@@ -34,9 +34,9 @@ lve remove Example
 lve terminate Example
 ```
 
-`create ~/Example` registers the folder, adds a Nautilus bookmark, and asks for the passphrase twice. The folder stays plaintext until you lock it. The bookmark keeps pointing at the folder, so Nautilus shows it as missing while the vault is locked.
+`create ~/Example` registers the folder, adds a Nautilus bookmark, and asks for the passphrase twice. The folder stays plaintext until you lock it. The bookmark keeps pointing at the folder, so Nautilus shows it as missing while the vault is locked. Lock and unlock put that line back if it is missing. Terminate removes only that line.
 
-`lock Example` packs `~/Example` into `~/Example.7z` and deletes the folder. It does not ask for the passphrase. After a crash, when the helper no longer holds the key, lock asks twice and then packs.
+`lock Example` packs `~/Example` into `~/Example.7z` and deletes the folder. It does not ask for the passphrase. After a crash, when the helper no longer holds the key, lock asks twice and then packs. A vault with no files, including one that contains only empty folders, is refused: `Example is empty; nothing to lock.` The vault stays as it is.
 
 `unlock Example` asks once, extracts the archive back to `~/Example`, and deletes the archive. The helper keeps the passphrase for the next lock.
 
@@ -90,8 +90,9 @@ The archive is AES-256 with filenames encrypted and no compression (`-mx=0`). 7z
 | 9    | not enough free space                                        |
 | 10   | prompt cancelled                                             |
 | 11   | vault not found                                              |
+| 12   | vault is empty                                               |
 
-Exit 11 is `org.linuxvault.Error.NotFound`. A missing name and another user's name are that same error. A wrong passphrase is `org.linuxvault.Error.WrongPassphrase` with the message `wrong passphrase`. The terminal prints `Wrong password.` and nothing from 7z. The helper always logs 7z's own text to the journal at debug priority, one `<7>` prefix per line, whether or not `RUST_LOG` is set. Read it with `journalctl -u linux-vault-helper -p debug`. A full disk prints `Not enough disk space.` A damaged archive prints `The archive is damaged.`
+Exit 11 is `org.linuxvault.Error.NotFound`. Exit 12 is `org.linuxvault.Error.Empty`, and the terminal prints `Name is empty; nothing to lock.` A missing name and another user's name are that same error. A wrong passphrase is `org.linuxvault.Error.WrongPassphrase` with the message `wrong passphrase`. The terminal prints `Wrong password.` and nothing from 7z. The helper always logs 7z's own text to the journal at debug priority, one `<7>` prefix per line, whether or not `RUST_LOG` is set. Read it with `journalctl -u linux-vault-helper -p debug`. A full disk prints `Not enough disk space.` A damaged archive prints `The archive is damaged.`
 
 ## Build
 

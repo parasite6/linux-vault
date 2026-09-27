@@ -33,7 +33,8 @@ use serde::{Deserialize, Serialize};
 use error::Result;
 use registry::{LockFile, Record, Registry};
 use sevenz::{
-    command_args, find_seven_zip, run, run_interruptible, run_without_passphrase, Credentials,
+    add_command, command_args, find_seven_zip, run, run_interruptible, run_without_passphrase,
+    Credentials,
 };
 
 pub use error::Error;
@@ -461,7 +462,16 @@ impl Vaults {
         }
 
         let archive_arg = format!("../{partial_name}");
-        let mut args = command_args("a", &archive_arg, None);
+        let mut args = match add_command(&archive_arg, passphrase) {
+            Ok(args) => args,
+            Err(error) => {
+                eprintln!(
+                    "<3>linux-vault-helper: encryption check failed for {}: passphrase_supplied=no",
+                    record.path.display()
+                );
+                return Err(error);
+            }
+        };
         args.push(".".to_string());
         if let Err(error) = run(
             &self.seven_zip,
@@ -477,7 +487,14 @@ impl Vaults {
         let checked = (|| {
             sync_file(&partial_path)?;
             sync_dir(parent)?;
-            self.require_encrypted(parent, &partial_name)?;
+            if let Err(error) = self.require_encrypted(parent, &partial_name) {
+                eprintln!(
+                    "<3>linux-vault-helper: encryption check failed for {}: passphrase_supplied={}",
+                    record.path.display(),
+                    !passphrase.is_empty()
+                );
+                return Err(error);
+            }
             let test_args = command_args("t", &partial_name, None);
             run(&self.seven_zip, &test_args, parent, passphrase, self.run_as)?;
             Ok(())
@@ -1123,11 +1140,12 @@ fn sync_tree(root: &Path) -> Result<()> {
 mod tests {
     #[test]
     fn add_command_has_the_required_switches_and_not_the_passphrase() {
-        let args = super::command_args("a", "Vault.7z", None);
+        let args = super::add_command("Vault.7z", b"secret").unwrap();
         assert_eq!(
             args,
             ["a", "-p", "-mhe=on", "-mx=0", "-y", "-bd", "--", "Vault.7z"]
         );
+        assert!(super::add_command("Vault.7z", b"").is_err());
         let passphrase = "secret passphrase";
         assert!(args.iter().all(|arg| !arg.contains(passphrase)));
     }

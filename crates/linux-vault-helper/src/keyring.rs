@@ -1,8 +1,13 @@
 //! The helper's process keyring.
 //!
-//! One keyring for the process, shared by every thread. The thread keyring is
-//! not used: an async task can move threads and would lose the key. Each key
-//! is possessor-only and is not linked into the user or session keyring.
+//! One ring for the whole process. [`create_process_keyring`] runs on the main
+//! thread before the async runtime starts any worker. A later
+//! `KEYCTL_GET_KEYRING_ID(KEY_SPEC_PROCESS_KEYRING)` on a thread whose
+//! credentials were copied before that call creates a second ring, and a
+//! passphrase stored there is invisible to the thread that handles `SIGTERM`.
+//!
+//! The thread keyring is not used. Each key is possessor-only and is not
+//! linked into the user keyring or the login session keyring.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -15,6 +20,33 @@ use crate::pinentry::Passphrase;
 
 const PAYLOAD_CAP: usize = 4096;
 
+static INSERT_THREAD: AtomicU64 = AtomicU64::new(0);
+static READ_THREAD: AtomicU64 = AtomicU64::new(0);
+
+/// Create the process keyring on this thread.
+///
+/// Call it from `main` before the runtime is built. Threads started afterwards
+/// inherit the ring. Calling it again on a thread that already has the ring
+/// returns that same ring.
+pub fn create_process_keyring() -> Result<(), HelperError> {
+    process_ring().map(|_| ())
+}
+
+/// Thread ids of the last passphrase store and the last passphrase read.
+///
+/// `0` means that operation has not run in this process. Tests use this to
+/// show the store and the `SIGTERM` read were different threads.
+pub fn passphrase_threads() -> (u64, u64) {
+    (
+        INSERT_THREAD.load(Ordering::SeqCst),
+        READ_THREAD.load(Ordering::SeqCst),
+    )
+}
+
+fn this_thread() -> u64 {
+    unsafe { nix::libc::pthread_self() as u64 }
+}
+
 /// Passphrases for unlocked vaults, stored in the process keyring.
 ///
 /// Cloning shares the same keys. This type cannot hand the bytes to a caller
@@ -26,6 +58,11 @@ pub struct ProcessKeys {
 
 impl ProcessKeys {
     pub fn new() -> Result<Self, HelperError> {
+        // The service already created the ring on the main thread. Tests that
+        // have not started other threads yet create it here, on their own
+        // main thread. This does not paper over a ring created too late: a
+        // thread that missed the first create still gets an empty ring of its
+        // own, and a later read fails.
         process_ring()?;
         static IDS: AtomicU64 = AtomicU64::new(0);
         let prefix = format!(
@@ -55,6 +92,7 @@ impl ProcessKeys {
             let _ = key.invalidate();
             return Err(named("storing passphrase", name, &error));
         }
+        INSERT_THREAD.store(this_thread(), Ordering::SeqCst);
         Ok(())
     }
 
@@ -75,6 +113,7 @@ impl ProcessKeys {
         }
         let passphrase = Passphrase::from_bytes(&buffer[..len]);
         buffer.zeroize();
+        READ_THREAD.store(this_thread(), Ordering::SeqCst);
         Ok(passphrase)
     }
 
@@ -122,7 +161,6 @@ impl ProcessKeys {
 }
 
 fn process_ring() -> Result<KeyRing, HelperError> {
-    // Create the process keyring on first use. A fresh process does not have one.
     KeyRing::from_special_id(KeyRingIdentifier::Process, true)
         .map_err(|error| named("creating the process keyring", "helper", &error))
 }
@@ -141,6 +179,7 @@ mod tests {
 
     #[test]
     fn a_passphrase_stays_on_the_process_keyring_and_is_wiped_at_lock() {
+        create_process_keyring().unwrap();
         let keys = ProcessKeys::new().unwrap();
         keys.insert(0, "Forge", Passphrase::from_bytes(b"secret"))
             .unwrap();
@@ -184,6 +223,7 @@ mod tests {
             return;
         }
         crate::limit_to_unit_capabilities();
+        create_process_keyring().unwrap();
         let keys = ProcessKeys::new().unwrap();
         keys.insert(0, "lve-trial", Passphrase::from_bytes(b"secret"))
             .unwrap();

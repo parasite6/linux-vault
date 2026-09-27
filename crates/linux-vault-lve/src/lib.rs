@@ -22,6 +22,7 @@ pub const NOT_LOGGED_IN: u8 = 8;
 pub const NO_SPACE: u8 = 9;
 pub const CANCELLED: u8 = 10;
 pub const NOT_FOUND: u8 = 11;
+pub const EMPTY: u8 = 12;
 
 const HELP: &str = "\
 lve — lock a folder in your home
@@ -52,6 +53,7 @@ Exit codes:
   9   not enough free space
   10  prompt cancelled
   11  vault not found
+  12  vault is empty
 ";
 
 #[derive(Debug)]
@@ -332,6 +334,9 @@ fn spoken(error: &zbus::Error) -> String {
     if name.ends_with("WrongPassphrase") {
         return "Wrong password.".into();
     }
+    if name.ends_with("Empty") {
+        return detail;
+    }
     let lower = detail.to_ascii_lowercase();
     if lower.contains("not enough disk space") || lower.contains("no space left") {
         return "Not enough disk space.".into();
@@ -369,6 +374,9 @@ fn exit_code_for(name: &str, message: &str) -> u8 {
     }
     if name.ends_with("WrongPassphrase") {
         return WRONG_PASSPHRASE;
+    }
+    if name.ends_with("Empty") {
+        return EMPTY;
     }
     let lower = message.to_ascii_lowercase();
     if lower.contains("wrong passphrase") {
@@ -421,6 +429,13 @@ mod exit_tests {
         assert_eq!(
             exit_code_for("org.linuxvault.Error.WrongPassphrase", "wrong passphrase"),
             WRONG_PASSPHRASE
+        );
+        assert_eq!(
+            exit_code_for(
+                "org.linuxvault.Error.Empty",
+                "Forge is empty; nothing to lock."
+            ),
+            EMPTY
         );
         assert_eq!(
             exit_code_for("org.linuxvault.Error.Failed", "wrong passphrase: no"),

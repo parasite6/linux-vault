@@ -11,6 +11,7 @@
 //! second run waits for the first to finish, sees the vaults already locked,
 //! and returns without locking them again.
 
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -229,6 +230,7 @@ impl ShutdownHandle {
     /// is reported.
     pub async fn shut_down(&self) {
         let _run = self.run.lock().await;
+        stop_log("stop sequence started");
         let first = self.gate.begin();
         if first {
             // The notification is the only step that talks to a bus.
@@ -240,7 +242,13 @@ impl ShutdownHandle {
             crate::worker::wait_for_workers(&self.workers, std::time::Duration::from_secs(30));
             self.gate.wait_idle().await;
         }
-        self.lock_what_is_open().await;
+        let locked = self.lock_what_is_open().await;
+        let names = if locked.is_empty() {
+            "none".to_string()
+        } else {
+            locked.join(", ")
+        };
+        stop_log(&format!("stop sequence finished: locked {names}"));
         self.inhibit.release().await;
     }
 
@@ -317,38 +325,93 @@ impl ShutdownHandle {
         None
     }
 
-    /// Lock unlocked vaults. This makes no D-Bus call.
-    async fn lock_what_is_open(&self) {
+    /// Lock unlocked vaults. This makes no D-Bus call. The returned names are
+    /// the vaults this call locked.
+    async fn lock_what_is_open(&self) -> Vec<String> {
         let vaults = Arc::clone(&self.vaults);
         let Ok(Ok(listed)) = tokio::task::spawn_blocking(move || vaults.list()).await else {
-            eprintln!("linux-vault-helper: cannot list vaults while shutting down");
-            return;
+            stop_log("cannot list vaults while shutting down");
+            return Vec::new();
         };
+        let mut locked = Vec::new();
         for vault in listed {
             if vault.state != State::Unlocked {
                 continue;
             }
+            if self.skip_empty(&vault).await {
+                stop_log(&format!("stop: {} left unlocked, empty", vault.name));
+                continue;
+            }
             match self.passphrases.read(vault.uid, &vault.name) {
-                Ok(passphrase) => self.lock_held(vault, passphrase).await,
+                Ok(passphrase) => {
+                    let name = vault.name.clone();
+                    if self.lock_held(vault, passphrase).await {
+                        locked.push(name);
+                    }
+                }
                 Err(HelperError::Failed(message)) if key_is_missing(&message) => {
+                    stop_log(&format!(
+                        "stop: {} needs recovery, passphrase not held",
+                        vault.name
+                    ));
                     self.mark_recovery(vault.uid, &vault.name).await;
                 }
                 Err(error) => {
-                    eprintln!("linux-vault-helper: {error}");
+                    stop_log(&format!("stop: {} needs recovery, {error}", vault.name));
                     self.mark_recovery(vault.uid, &vault.name).await;
                 }
             }
         }
+        locked
     }
 
-    async fn lock_held(&self, vault: linux_vault::Vault, passphrase: crate::Passphrase) {
+    /// An empty unlocked vault stays unlocked. A folder that cannot be read
+    /// is marked for recovery, the same as any other shutdown failure.
+    async fn skip_empty(&self, vault: &linux_vault::Vault) -> bool {
+        let Some((uid, gid, home)) = crate::ids_for_path(&vault.path) else {
+            eprintln!(
+                "linux-vault-helper: cannot see the owner of {}; it needs recovery",
+                vault.name
+            );
+            self.mark_recovery(vault.uid, &vault.name).await;
+            return true;
+        };
+        let vaults = self.vaults.share();
+        let path = vault.path.clone();
+        let live = Arc::clone(&self.workers);
+        let checked = tokio::task::spawn_blocking(move || {
+            let mut worker =
+                crate::worker::HomeWorker::spawn(uid, gid, &home, vaults, live.clone())?;
+            worker.contains_regular_file(&path)
+        })
+        .await;
+        match checked {
+            Ok(Ok(false)) => true,
+            Ok(Ok(true)) => false,
+            Ok(Err(error)) => {
+                eprintln!("linux-vault-helper: {error}");
+                self.mark_recovery(vault.uid, &vault.name).await;
+                true
+            }
+            Err(error) => {
+                eprintln!("linux-vault-helper: {error}");
+                self.mark_recovery(vault.uid, &vault.name).await;
+                true
+            }
+        }
+    }
+
+    /// `true` when the archive replaced the folder.
+    async fn lock_held(&self, vault: linux_vault::Vault, passphrase: crate::Passphrase) -> bool {
         self.lock_attempts.fetch_add(1, Ordering::SeqCst);
         let name = vault.name.clone();
         let path = vault.path.clone();
         let Some((uid, gid, home)) = crate::ids_for_path(&path) else {
-            eprintln!("linux-vault-helper: cannot see the owner of {name}; it needs recovery");
+            stop_log(&format!(
+                "stop: {name} needs recovery, owner cannot be seen"
+            ));
             self.mark_recovery(vault.uid, &name).await;
-            return;
+            return false;
         };
         let vaults = self.vaults.share();
         let passphrases = self.passphrases.clone();
@@ -433,12 +496,15 @@ impl ShutdownHandle {
                 if let Err(error) = self.passphrases.forget(vault.uid, &vault.name) {
                     eprintln!("linux-vault-helper: {error}");
                 }
+                true
             }
             Ok(Err(error)) => {
-                eprintln!("linux-vault-helper: cannot lock {}: {error}", vault.name);
+                stop_log(&format!("stop: cannot lock {}: {error}", vault.name));
+                false
             }
             Err(error) => {
-                eprintln!("linux-vault-helper: cannot lock {}: {error}", vault.name);
+                stop_log(&format!("stop: cannot lock {}: {error}", vault.name));
+                false
             }
         }
     }
@@ -458,6 +524,14 @@ impl ShutdownHandle {
             }
         }
     }
+}
+
+/// Journal info. `<6>` is syslog info, so `journalctl -u linux-vault-helper`
+/// shows it without `-p debug`. The passphrase is never included.
+pub fn stop_log(message: &str) {
+    let mut err = std::io::stderr();
+    let _ = writeln!(err, "<6>linux-vault-helper: {message}");
+    let _ = err.flush();
 }
 
 fn key_is_missing(message: &str) -> bool {
