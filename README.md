@@ -18,6 +18,9 @@ That installs `lve`, the helper at `/usr/libexec/linux-vault-helper`, and the sy
 
 The package also sets `kernel.yama.ptrace_scope=1`, so one process running as you cannot attach to another. A later file in `/etc/sysctl.d/` can override that.
 
+## Platform. 
+linux-vault v0.1 is built and tested only on Fedora Workstation (Fedora 44, x86_64). It depends on systemd (logind, user services), 7-Zip, and pinentry-qt, and ships as an RPM. Fedora Atomic desktops (Silverblue, Kinoite) are not supported, because home directories live under /var/home. Other distributions may work with manual setup, but they are untested and not officially unsupported.
+
 ## Use
 
 ```bash
