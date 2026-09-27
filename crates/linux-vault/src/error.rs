@@ -18,6 +18,12 @@ pub enum Error {
     NotFound,
     /// A vault with this name or path is already registered, or the archive already exists.
     AlreadyExists,
+    /// The folder is inside another vault, or contains one.
+    Nested {
+        name: String,
+        other: String,
+        nesting: crate::Nesting,
+    },
     /// The folder is not inside the allowed root.
     OutsideRoot,
     /// A symlink inside the vault points outside the vault.
@@ -44,6 +50,8 @@ pub enum Error {
     },
     /// The registry file could not be parsed.
     Registry(String),
+    /// `registry.json` was moved aside. Nothing may be written until it is resolved.
+    RegistryDamaged(String),
     Io(io::Error),
 }
 
@@ -54,6 +62,18 @@ impl fmt::Display for Error {
             Error::WrongPassphrase { message } => write!(f, "wrong passphrase: {message}"),
             Error::NotFound => write!(f, "vault not found"),
             Error::AlreadyExists => write!(f, "vault already exists"),
+            Error::Nested {
+                name,
+                other,
+                nesting,
+            } => match nesting {
+                crate::Nesting::Inside => {
+                    write!(f, "Cannot create {name}: it is inside vault {other}.")
+                }
+                crate::Nesting::Contains => {
+                    write!(f, "Cannot create {name}: it contains vault {other}.")
+                }
+            },
             Error::OutsideRoot => write!(f, "vault path is outside the allowed root"),
             Error::EscapingSymlink => {
                 write!(f, "symlink inside the vault points outside it")
@@ -71,6 +91,7 @@ impl fmt::Display for Error {
                 write!(f, "7z failed (status {status:?}): {message}")
             }
             Error::Registry(message) => write!(f, "registry: {message}"),
+            Error::RegistryDamaged(message) => write!(f, "{message}"),
             Error::Io(error) => write!(f, "{error}"),
         }
     }

@@ -19,8 +19,14 @@ pub enum HelperError {
     NotLoggedIn(String),
     /// The passphrase did not match. The message is only `wrong passphrase`.
     WrongPassphrase(String),
+    /// The disk filled up. The message is only `not enough disk space`.
+    NoSpace(String),
     /// The folder has no regular files. The message names the vault.
     Empty(String),
+    /// The folder is inside another vault, or contains one.
+    Nested(String),
+    /// `registry.json` was moved aside. No method runs until the helper is restarted.
+    RegistryBroken(String),
     /// Pinentry or the vault operation failed. The message has no passphrase.
     Failed(String),
 }

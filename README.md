@@ -13,10 +13,10 @@ v1 is this command and that helper. It is for regular Fedora, where home is `/ho
 The package is `linux-vault`. It depends on `7zip` and `pinentry-qt`.
 
 ```bash
-sudo dnf install linux-vault-0.1.4-1.fc44.x86_64.rpm
+sudo dnf install linux-vault-0.1.8-1.fc44.x86_64.rpm
 ```
 
-That installs `lve`, the helper at `/usr/libexec/linux-vault-helper`, and the systemd unit `linux-vault-helper.service`. The unit starts on the system bus as `org.linuxvault.Helper`. An upgrade does not restart the helper, so a `dnf upgrade` does not drop passphrases that are still held. The new helper takes effect at the next boot, or when you restart the service yourself. A restart locks every vault that is still unlocked.
+That installs `lve`, the helper at `/usr/libexec/linux-vault-helper`, and the systemd unit `linux-vault-helper.service`. The unit starts on the system bus as `org.linuxvault.Helper`. An upgrade does not restart the helper, so a `dnf upgrade` does not drop passphrases that are still held. The running helper starts its workers from the image it was started with, so a shutdown before the next restart can still lock. The new helper takes effect at the next boot, or when you restart the service yourself. A restart locks every vault that is still unlocked.
 
 The package also sets `kernel.yama.ptrace_scope=1`, so one process running as you cannot attach to another. A later file in `/etc/sysctl.d/` can override that.
 
@@ -40,7 +40,7 @@ lve terminate Example
 
 `unlock Example` asks once, extracts the archive back to `~/Example`, and deletes the archive. The helper keeps the passphrase for the next lock.
 
-`ls` lists only your vaults. A vault can be `unlocked`, `locked`, `needs_recovery`, `locking`, or `unlocking`.
+`ls` lists only your vaults. A vault can be `unlocked`, `locked`, `locked (not immutable)`, `needs_recovery`, `locking`, or `unlocking`. `locked (not immutable)` means the archive is there, and this filesystem would not take the immutable flag, so the archive can still be deleted.
 
 `remove Example` drops the registry entry. The vaults contents are preserved. If the vault is locked, it unlocks first, which asks for the passphrase. The folder and the bookmark stay.
 
@@ -60,7 +60,13 @@ While any vault is unlocked, the helper holds a logind delay inhibitor. On shutd
 
 A vault that is still unlocked and whose passphrase is gone is marked `needs_recovery`. The folder is plaintext. The next `lve` run says so on stderr. Lock it and enter the passphrase twice. Until then, only disk encryption protects that folder.
 
-A lock or unlock that dies in the middle is reconciled from the filenames. A partial archive or a staging folder is discarded. If both the folder and the archive exist, the folder is deleted and the vault is locked. If only the folder remains, the vault needs recovery.
+A lock or unlock that dies in the middle is reconciled from the filenames. A partial archive or a staging folder is discarded. If both the folder and the archive exist, the folder is deleted only when the archive is still the one this vault wrote. A different file at that name is left alone and the vault needs recovery. If only the folder remains, the vault needs recovery.
+
+If `registry.json` cannot be read, the helper moves it to `registry.json.broken-<timestamp>` under `/var/lib/linux-vault` and then refuses every `lve` command. The message names that file. `lve` exits 14. Fix the file, or put the saved copy back as `registry.json`, delete `registry.damaged` in that directory, and restart the helper:
+
+```bash
+sudo systemctl restart linux-vault-helper
+```
 
 ## What the passphrase touches
 
@@ -91,8 +97,10 @@ The archive is AES-256 with filenames encrypted and no compression (`-mx=0`). 7z
 | 10   | prompt cancelled                                             |
 | 11   | vault not found                                              |
 | 12   | vault is empty                                               |
+| 13   | the folder is inside another vault, or contains one         |
+| 14   | the vault registry is damaged                                |
 
-Exit 11 is `org.linuxvault.Error.NotFound`. Exit 12 is `org.linuxvault.Error.Empty`, and the terminal prints `Name is empty; nothing to lock.` A missing name and another user's name are that same error. A wrong passphrase is `org.linuxvault.Error.WrongPassphrase` with the message `wrong passphrase`. The terminal prints `Wrong password.` and nothing from 7z. The helper always logs 7z's own text to the journal at debug priority, one `<7>` prefix per line, whether or not `RUST_LOG` is set. Read it with `journalctl -u linux-vault-helper -p debug`. A full disk prints `Not enough disk space.` A damaged archive prints `The archive is damaged.`
+Exit 11 is `org.linuxvault.Error.NotFound`. Exit 12 is `org.linuxvault.Error.Empty`, and the terminal prints `Name is empty; nothing to lock.` Exit 13 is `org.linuxvault.Error.Nested`, and the terminal prints `Cannot create Name: it is inside vault Other.` or `Cannot create Name: it contains vault Other.` Exit 14 is `org.linuxvault.Error.RegistryBroken`. A missing name and another user's name are that same error. A wrong passphrase is `org.linuxvault.Error.WrongPassphrase` with the message `wrong passphrase`. The terminal prints `Wrong password.` and nothing from 7z. The helper always logs 7z's own text to the journal at debug priority, one `<7>` prefix per line, whether or not `RUST_LOG` is set. Read it with `journalctl -u linux-vault-helper -p debug`. A full disk prints `Not enough disk space.` A damaged archive prints `The archive is damaged.`
 
 ## Build
 

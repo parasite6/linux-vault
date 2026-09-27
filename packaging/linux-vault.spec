@@ -2,7 +2,7 @@
 %global debug_package %{nil}
 
 Name:           linux-vault
-Version:        0.1.4
+Version:        0.1.8
 Release:        1%{?dist}
 Summary:        Lock a folder in your home
 
@@ -35,7 +35,9 @@ unset CARGO_TARGET_DIR
 cargo build --release --locked -p linux-vault-helper -p linux-vault-lve
 
 %install
-install -D -m 0755 target/release/linux-vault-helper %{buildroot}%{_libexecdir}/linux-vault-helper
+# 0711: executable, not readable by other users. The kernel then starts the
+# worker non-dumpable from the first instruction.
+install -D -m 0711 target/release/linux-vault-helper %{buildroot}%{_libexecdir}/linux-vault-helper
 install -D -m 0755 target/release/lve %{buildroot}%{_bindir}/lve
 install -D -m 0644 packaging/systemd/linux-vault-helper.service %{buildroot}%{_unitdir}/linux-vault-helper.service
 install -D -m 0644 packaging/dbus/org.linuxvault.Helper.service %{buildroot}%{_datadir}/dbus-1/system-services/org.linuxvault.Helper.service
@@ -68,6 +70,14 @@ install -D -m 0644 packaging/systemd/logind.conf.d/linux-vault.conf %{buildroot}
 %{_prefix}/lib/systemd/logind.conf.d/linux-vault.conf
 
 %changelog
+* Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.8-1
+- A locked archive whose filesystem rejects the immutable flag stays locked, and lve ls says it is not immutable.
+* Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.7-1
+- A refused lock with no passphrase marks the vault for recovery, and a stopped 7z is not reported as an unreadable archive.
+* Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.6-1
+- Refuse a nested vault, and refuse every operation when the registry cannot be read.
+* Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.5-1
+- Do not delete a folder unless the archive is this vault's. One vault that cannot be reconciled no longer stops the helper, and replacing the helper binary no longer stops a shutdown lock.
 * Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.4-1
 - Lock held vaults on stop. The passphrase was invisible to the thread that handled SIGTERM.
 * Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.3-1

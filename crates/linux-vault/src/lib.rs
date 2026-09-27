@@ -31,7 +31,9 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use error::Result;
-use registry::{LockFile, Record, Registry};
+pub use registry::ArchiveIdentity as ArchiveId;
+pub use registry::{vaults_are_nested, Nesting};
+use registry::{ArchiveIdentity, LockFile, Record, Registry};
 use sevenz::{
     add_command, command_args, find_seven_zip, run, run_interruptible, run_without_passphrase,
     Credentials,
@@ -118,6 +120,8 @@ pub struct Vault {
     pub name: String,
     pub path: PathBuf,
     pub state: State,
+    /// False when the vault is locked and the immutable flag could not be set.
+    pub immutable: bool,
 }
 
 /// Registry plus the 7z operations that move a vault between folder and archive.
@@ -291,6 +295,8 @@ impl Vaults {
                 name: name.clone(),
                 path: path.clone(),
                 state: State::Unlocked,
+                archive: None,
+                immutable: true,
             })?;
             Ok(())
         })?;
@@ -299,6 +305,7 @@ impl Vaults {
             name,
             path,
             state: State::Unlocked,
+            immutable: true,
         })
     }
 
@@ -354,21 +361,44 @@ impl Vaults {
                     remove_path(&partial)?;
                 }
                 let folder = record.path.is_dir();
-                let archive = archive_for(&record.path).is_file();
+                let archive_path = archive_for(&record.path);
+                let archive = archive_path.is_file();
                 if !folder && !archive {
                     registry.remove(uid, &name)?;
                     removed.push(record.path);
                     sync_dir(&parent)?;
                     continue;
                 }
-                let state = if folder && archive {
+                let live = if archive {
+                    ArchiveIdentity::capture(&archive_path).ok()
+                } else {
+                    None
+                };
+                let proven = live
+                    .as_ref()
+                    .is_some_and(|live| record.archive.as_ref() == Some(live));
+                let state = if folder && archive && proven {
                     fs::remove_dir_all(&record.path)?;
                     State::Locked
+                } else if folder && archive {
+                    eprintln!(
+                        "<3>linux-vault: {} and {} both exist and the archive is not this vault's; deleted nothing",
+                        record.path.display(),
+                        archive_path.display()
+                    );
+                    State::NeedsRecovery
                 } else if archive {
                     State::Locked
                 } else {
                     State::NeedsRecovery
                 };
+                if let Ok(entry) = registry.get_mut(uid, &name) {
+                    if state == State::Locked {
+                        if let Some(live) = live.clone() {
+                            entry.archive = Some(live);
+                        }
+                    }
+                }
                 sync_dir(&parent)?;
                 if state == State::Locked {
                     locked.push(record.path.clone());
@@ -386,11 +416,35 @@ impl Vaults {
         })
     }
 
-    /// The folder is still plaintext and this process has no passphrase for it.
+    /// Remember the archive written by the lock that just renamed it into place.
+    pub fn archive_identity(&self, uid: u32, name: &str) -> Result<Option<ArchiveIdentity>> {
+        self.read(|registry| Ok(registry.get(uid, name)?.archive.clone()))
+    }
+
+    pub fn record_archive(&self, uid: u32, name: &str, identity: ArchiveIdentity) -> Result<()> {
+        self.write(|registry| {
+            registry.get_mut(uid, name)?.archive = Some(identity);
+            Ok(())
+        })
+    }
+
+    /// Whether the locked archive has the immutable flag. A filesystem that
+    /// rejects the flag stays locked, and `lve ls` says so.
+    pub fn set_immutable(&self, uid: u32, name: &str, immutable: bool) -> Result<()> {
+        self.write(|registry| {
+            registry.get_mut(uid, name)?.immutable = immutable;
+            Ok(())
+        })
+    }
+
+    /// The folder is still plaintext, or a lock or unlock did not finish.
     pub fn mark_needs_recovery(&self, uid: u32, name: &str) -> Result<()> {
         self.write(|registry| {
             let entry = registry.get_mut(uid, name)?;
-            if matches!(entry.state, State::Unlocked | State::NeedsRecovery) {
+            if matches!(
+                entry.state,
+                State::Unlocked | State::NeedsRecovery | State::Locking | State::Unlocking
+            ) {
                 entry.state = State::NeedsRecovery;
             }
             Ok(())
@@ -437,7 +491,7 @@ impl Vaults {
             Ok((record, parent))
         })?;
         let (record, parent) = record;
-        let packed = self.pack(&record, &parent, passphrase);
+        let packed = self.finish_pack(&record, &parent, passphrase);
         let previous = record.state;
         self.write(|registry| {
             let entry = registry.get_mut(uid, name)?;
@@ -453,7 +507,7 @@ impl Vaults {
         packed
     }
 
-    fn pack(&self, record: &Record, parent: &Path, passphrase: &[u8]) -> Result<()> {
+    fn pack(&self, record: &Record, parent: &Path, passphrase: &[u8]) -> Result<ArchiveIdentity> {
         let final_path = archive_for(&record.path);
         let partial_name = partial_file_name(&record.path)?;
         let partial_path = parent.join(&partial_name);
@@ -509,6 +563,19 @@ impl Vaults {
         // the parent before deleting the folder, or a power cut can persist
         // the delete and leave Name.7z.lve-partial, which reconcile removes.
         sync_dir(parent)?;
+        ArchiveIdentity::capture(&final_path).map_err(Error::from)
+    }
+
+    /// Record the archive, then delete the plaintext. The identity is on disk
+    /// before the folder goes, so a crash in between can still prove the archive.
+    fn finish_pack(&self, record: &Record, parent: &Path, passphrase: &[u8]) -> Result<()> {
+        let identity = self.pack(record, parent, passphrase)?;
+        let uid = record.uid;
+        let name = record.name.clone();
+        self.write(|registry| {
+            registry.get_mut(uid, &name)?.archive = Some(identity);
+            Ok(())
+        })?;
         fs::remove_dir_all(&record.path)?;
         sync_dir(parent)?;
         self.mark_immutable(&record.path, true)
@@ -547,7 +614,7 @@ impl Vaults {
                     operation: "unlock",
                 });
             }
-            if record.path.exists() {
+            if directory_occupied(&record.path)? {
                 return Err(Error::AlreadyExists);
             }
             let archive = archive_for(&record.path);
@@ -679,11 +746,16 @@ impl Vaults {
             return Err(Error::OutsideRoot);
         }
         self.write(|registry| {
+            if archive_for(path).exists() {
+                return Err(Error::AlreadyExists);
+            }
             registry.insert(Record {
                 uid,
                 name: name.clone(),
                 path: path.to_path_buf(),
                 state: State::Unlocked,
+                archive: None,
+                immutable: true,
             })?;
             Ok(())
         })?;
@@ -692,6 +764,7 @@ impl Vaults {
             name,
             path: path.to_path_buf(),
             state: State::Unlocked,
+            immutable: true,
         })
     }
 
@@ -754,16 +827,23 @@ impl Vaults {
         prepare_folder(folder, &self.allowed_root)
     }
 
-    /// Pack a plaintext folder. Does not write the registry.
-    pub fn pack_folder(&self, folder: &Path, passphrase: &[u8]) -> Result<()> {
+    /// Pack a plaintext folder and return the archive's identity. Does not
+    /// write the registry and does not delete the folder. The caller records
+    /// the identity, then deletes the plaintext.
+    pub fn pack_folder(&self, folder: &Path, passphrase: &[u8]) -> Result<ArchiveIdentity> {
         check_passphrase(passphrase)?;
         refuse_escaping_symlinks(folder)?;
+        if archive_for(folder).exists() {
+            return Err(Error::AlreadyExists);
+        }
         let parent = parent_dir(folder)?;
         let record = Record {
             uid: 0,
             name: vault_name(folder)?,
             path: folder.to_path_buf(),
             state: State::Unlocked,
+            archive: None,
+            immutable: true,
         };
         self.pack(&record, &parent, passphrase)
     }
@@ -771,11 +851,16 @@ impl Vaults {
     /// Extract an archive over `folder`. Does not write the registry.
     pub fn unpack_folder(&self, folder: &Path, passphrase: &[u8]) -> Result<()> {
         check_passphrase(passphrase)?;
+        if directory_occupied(folder)? {
+            return Err(Error::AlreadyExists);
+        }
         let record = Record {
             uid: 0,
             name: vault_name(folder)?,
             path: folder.to_path_buf(),
             state: State::Locked,
+            archive: None,
+            immutable: true,
         };
         self.extract(&record, passphrase)
     }
@@ -822,16 +907,21 @@ impl Vaults {
         if partial.symlink_metadata().is_ok() {
             remove_path(&partial)?;
         }
-        let mut folder_exists = folder.is_dir();
-        let archive = archive_for(folder).is_file();
-        if folder_exists && archive {
-            fs::remove_dir_all(folder)?;
-            folder_exists = false;
-        }
+        let folder_exists = folder.is_dir();
+        let occupied = folder_exists && directory_occupied(folder).unwrap_or(true);
+        let archive_path = archive_for(folder);
+        let archive = archive_path.is_file();
+        let identity = if archive {
+            ArchiveIdentity::capture(&archive_path).ok()
+        } else {
+            None
+        };
         sync_dir(&parent)?;
         Ok(FilenameFacts {
             folder: folder_exists,
             archive,
+            occupied,
+            identity,
         })
     }
 
@@ -973,6 +1063,9 @@ fn record_flag(calls: &Mutex<Vec<FlagChange>>, set: bool) {
 pub struct FilenameFacts {
     pub folder: bool,
     pub archive: bool,
+    /// The folder exists and has at least one directory entry.
+    pub occupied: bool,
+    pub identity: Option<ArchiveIdentity>,
 }
 
 impl From<&Record> for Vault {
@@ -982,8 +1075,19 @@ impl From<&Record> for Vault {
             name: record.name.clone(),
             path: record.path.clone(),
             state: record.state,
+            immutable: record.immutable,
         }
     }
+}
+
+fn directory_occupied(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if !path.is_dir() {
+        return Ok(true);
+    }
+    Ok(fs::read_dir(path)?.next().is_some())
 }
 
 fn current_uid() -> u32 {

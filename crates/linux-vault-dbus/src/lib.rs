@@ -25,7 +25,9 @@ pub async fn connect_client() -> zbus::Result<zbus::Connection> {
 
 /// One vault, as `List` will return it once the helper is connected to the core.
 ///
-/// `state` is `unlocked`, `locked`, `needs_recovery`, `locking`, or `unlocking`.
+/// `state` is `unlocked`, `locked`, `locked (not immutable)`, `needs_recovery`,
+/// `locking`, or `unlocking`. `locked (not immutable)` is a locked archive
+/// whose filesystem rejected the immutable flag, so it can still be deleted.
 #[derive(
     Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, zbus::zvariant::Type,
 )]

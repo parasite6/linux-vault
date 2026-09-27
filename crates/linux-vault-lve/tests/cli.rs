@@ -261,6 +261,7 @@ async fn a_vault_removed_before_the_write_is_not_found() {
     let folder = session.dir.path.join("Forge");
     let (code, _out, err) = invoke(&session, &["create", folder.to_str().unwrap()]).await;
     assert_eq!(code, OK, "{err}");
+    fs::write(folder.join("note.txt"), b"hello\n").unwrap();
     let (code, _out, err) = invoke(&session, &["lock", "Forge"]).await;
     assert_eq!(code, NOT_FOUND, "{err}");
     assert!(err.contains("vault not found"), "{err}");

@@ -23,6 +23,8 @@ pub const NO_SPACE: u8 = 9;
 pub const CANCELLED: u8 = 10;
 pub const NOT_FOUND: u8 = 11;
 pub const EMPTY: u8 = 12;
+pub const NESTED: u8 = 13;
+pub const REGISTRY_BROKEN: u8 = 14;
 
 const HELP: &str = "\
 lve — lock a folder in your home
@@ -54,6 +56,8 @@ Exit codes:
   10  prompt cancelled
   11  vault not found
   12  vault is empty
+  13  the folder is inside another vault, or contains one
+  14  the vault registry is damaged
 ";
 
 #[derive(Debug)]
@@ -78,6 +82,20 @@ pub enum Command {
     Terminate(String),
 }
 
+fn absolute_path(path: &str) -> String {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    match std::env::current_dir() {
+        Ok(mut full) => {
+            full.push(path);
+            full.display().to_string()
+        }
+        Err(_) => path.display().to_string(),
+    }
+}
+
 pub fn parse(args: &[String]) -> Result<Invocation, u8> {
     let mut json = false;
     let mut words = Vec::new();
@@ -90,7 +108,7 @@ pub fn parse(args: &[String]) -> Result<Invocation, u8> {
         }
     }
     let command = match words.as_slice() {
-        ["create", path] => Command::Create((*path).to_string()),
+        ["create", path] => Command::Create(absolute_path(path)),
         ["lock", name] => Command::Lock((*name).to_string()),
         ["unlock", name] => Command::Unlock((*name).to_string()),
         ["ls"] => Command::List,
@@ -334,11 +352,14 @@ fn spoken(error: &zbus::Error) -> String {
     if name.ends_with("WrongPassphrase") {
         return "Wrong password.".into();
     }
-    if name.ends_with("Empty") {
+    if name.ends_with("Empty") || name.ends_with("Nested") || name.ends_with("RegistryBroken") {
         return detail;
     }
     let lower = detail.to_ascii_lowercase();
-    if lower.contains("not enough disk space") || lower.contains("no space left") {
+    if name.ends_with("NoSpace")
+        || lower.contains("not enough disk space")
+        || lower.contains("no space left")
+    {
         return "Not enough disk space.".into();
     }
     if lower.contains("the archive is damaged") {
@@ -375,8 +396,17 @@ fn exit_code_for(name: &str, message: &str) -> u8 {
     if name.ends_with("WrongPassphrase") {
         return WRONG_PASSPHRASE;
     }
+    if name.ends_with("NoSpace") {
+        return NO_SPACE;
+    }
     if name.ends_with("Empty") {
         return EMPTY;
+    }
+    if name.ends_with("Nested") {
+        return NESTED;
+    }
+    if name.ends_with("RegistryBroken") {
+        return REGISTRY_BROKEN;
     }
     let lower = message.to_ascii_lowercase();
     if lower.contains("wrong passphrase") {
@@ -486,6 +516,24 @@ mod exit_tests {
                 "No space left on device (os error 28)"
             ),
             NO_SPACE
+        );
+        assert_eq!(
+            exit_code_for("org.linuxvault.Error.NoSpace", "not enough disk space"),
+            NO_SPACE
+        );
+        assert_eq!(
+            exit_code_for(
+                "org.linuxvault.Error.Nested",
+                "Cannot create Inner: it is inside vault Outer."
+            ),
+            NESTED
+        );
+        assert_eq!(
+            exit_code_for(
+                "org.linuxvault.Error.RegistryBroken",
+                "the vault registry is damaged; /var/lib/linux-vault/registry.json.broken-1 was kept aside. Restore or fix that file, then restart the helper"
+            ),
+            REGISTRY_BROKEN
         );
         assert_eq!(
             exit_code_for(

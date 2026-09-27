@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -8,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UnixStream;
 
 use linux_vault::{FlagChange, Vaults};
-use linux_vault_dbus::{HelperProxy, OBJECT_PATH};
+use linux_vault_dbus::{HelperProxy, VaultStatus, OBJECT_PATH};
 use linux_vault_helper::{Account, Authorizer, Helper, Prompt};
 use zbus::connection::Builder;
 use zbus::Guid;
@@ -647,6 +648,7 @@ async fn recovery_without_a_repeated_passphrase_leaves_the_folder() {
         .unwrap()
         .trace_immutable_flag();
     vaults.create(&folder).unwrap();
+    fs::write(folder.join("note.txt"), b"hello\n").unwrap();
 
     let proxy = proxy(&session.client).await;
     let error = proxy.lock("Forge").await.unwrap_err().to_string();
@@ -1534,8 +1536,8 @@ async fn peer_round(
     let mut child = child.spawn().unwrap();
     let peer_out = child.stdout.take();
     let peer_err = child.stderr.take();
-    let out_thread = std::thread::spawn(move || read_pipe(peer_out));
-    let err_thread = std::thread::spawn(move || read_pipe(peer_err));
+    let out_thread = std::thread::spawn(move || read_pipe(peer_out, false, false));
+    let err_thread = std::thread::spawn(move || read_pipe(peer_err, false, true));
     let accepted =
         tokio::time::timeout(std::time::Duration::from_secs(15), listener.accept()).await;
     let Ok(accepted) = accepted else {
@@ -1887,7 +1889,17 @@ fn watch_test(test_name: &str) {
 }
 
 /// Run `command` in its own process group and kill that group after 60 seconds.
-fn supervised(mut command: std::process::Command) -> std::process::Output {
+fn supervised(command: std::process::Command) -> std::process::Output {
+    supervise(command, false)
+}
+
+/// Like [`supervised`], and copy the child's stdout and stderr to this process
+/// as they arrive so `--nocapture` shows them.
+fn supervised_forwarding(command: std::process::Command) -> std::process::Output {
+    supervise(command, true)
+}
+
+fn supervise(mut command: std::process::Command, forward: bool) -> std::process::Output {
     unsafe {
         command.pre_exec(|| {
             if nix::libc::setsid() < 0 {
@@ -1903,8 +1915,8 @@ fn supervised(mut command: std::process::Command) -> std::process::Output {
     let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let out_thread = std::thread::spawn(move || read_pipe(stdout));
-    let err_thread = std::thread::spawn(move || read_pipe(stderr));
+    let out_thread = std::thread::spawn(move || read_pipe(stdout, forward, false));
+    let err_thread = std::thread::spawn(move || read_pipe(stderr, forward, true));
     let start = std::time::Instant::now();
     let limit = std::time::Duration::from_secs(60);
     let mut timed_out = false;
@@ -1941,11 +1953,37 @@ fn supervised(mut command: std::process::Command) -> std::process::Output {
     }
 }
 
-fn read_pipe(mut pipe: Option<impl std::io::Read>) -> Vec<u8> {
+fn read_pipe(mut pipe: Option<impl std::io::Read>, forward: bool, to_stderr: bool) -> Vec<u8> {
     let Some(ref mut pipe) = pipe else {
         return Vec::new();
     };
-    read_limited(pipe)
+    if !forward {
+        return read_limited(pipe);
+    }
+    const CAP: usize = 64 * 1024;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if to_stderr {
+                    let mut err = std::io::stderr();
+                    let _ = err.write_all(&chunk[..n]);
+                    let _ = err.flush();
+                } else {
+                    let mut out = std::io::stdout();
+                    let _ = out.write_all(&chunk[..n]);
+                    let _ = out.flush();
+                }
+                if buf.len() < CAP {
+                    let keep = n.min(CAP - buf.len());
+                    buf.extend_from_slice(&chunk[..keep]);
+                }
+            }
+        }
+    }
+    buf
 }
 
 fn read_limited(pipe: &mut dyn std::io::Read) -> Vec<u8> {
@@ -2112,4 +2150,844 @@ fn immutable_is_set(path: &std::path::Path) -> bool {
     unsafe { nix::libc::close(fd) };
     assert_eq!(rc, 0, "reading the immutable flag on {}", path.display());
     flags & 0x10 != 0
+}
+
+fn rerun_with_unit_caps(name: &str) -> bool {
+    if std::env::var_os("LVE_UNIT_CAPS").is_some() {
+        linux_vault_helper::limit_to_unit_capabilities();
+        return false;
+    }
+    // The child keeps only the unit's capabilities, so it has no
+    // CAP_DAC_OVERRIDE. A mode 755 directory owned by the user, and anything
+    // under a mode 700 home, are then unreachable. Stage the helper on
+    // /var/tmp and create the vaults there.
+    let tmp = PathBuf::from("/var/tmp/lve-cursor-tests");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o1777)).unwrap();
+    let (helper, _staged) = stage_outside_home(&helper_binary());
+    let output = supervised({
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env("LVE_UNIT_CAPS", "1")
+            .env("TMPDIR", &tmp)
+            .env("LVE_HELPER_BIN", &helper);
+        command
+    });
+    let text = String::from_utf8_lossy(&output.stderr);
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "limited-capability child failed: {}\n{out}{text}",
+        output.status
+    );
+    true
+}
+
+#[tokio::test]
+async fn a_stray_archive_never_deletes_the_folder() {
+    if rerun_with_unit_caps("a_stray_archive_never_deletes_the_folder") {
+        return;
+    }
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let folder = session.dir.path.join("Photos");
+    proxy.create(folder.to_str().unwrap()).await.unwrap();
+    fs::write(folder.join("note.txt"), b"keep me\n").unwrap();
+    let stray = session.dir.path.join("Photos.7z");
+    fs::write(&stray, b"not this vault\n").unwrap();
+
+    let error = proxy.lock("Photos").await.unwrap_err().to_string();
+    assert!(
+        error.contains("already exists and is not this vault's archive"),
+        "{error}"
+    );
+    assert_eq!(fs::read(folder.join("note.txt")).unwrap(), b"keep me\n");
+    assert_eq!(fs::read(&stray).unwrap(), b"not this vault\n");
+
+    session.held.forget(caller_uid(), "Photos").unwrap();
+    let vaults = Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap();
+    vaults
+        .set_state(caller_uid(), "Photos", linux_vault::State::NeedsRecovery)
+        .unwrap();
+    let before = fs::read_to_string(&session.log).unwrap_or_default();
+    let error = proxy.lock("Photos").await.unwrap_err().to_string();
+    assert!(error.contains("not this vault's archive"), "{error}");
+    let transcript = fs::read_to_string(&session.log).unwrap_or_default();
+    let added = transcript.get(before.len()..).unwrap_or(&transcript);
+    assert!(!added.contains("GETPIN"), "cancel path prompted: {added}");
+    assert_eq!(fs::read(folder.join("note.txt")).unwrap(), b"keep me\n");
+
+    fs::remove_file(&stray).unwrap();
+    let _restarted = Helper::new(
+        Authorizer::Allow,
+        Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap(),
+        Prompt::Program(vec![session.dir.path.join("pinentry").into()]),
+        account(&session.dir.path),
+    )
+    .unwrap();
+    fs::write(&stray, b"crash leftover\n").unwrap();
+    let _after_crash = Helper::new(
+        Authorizer::Allow,
+        Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap(),
+        Prompt::Program(vec![session.dir.path.join("pinentry").into()]),
+        account(&session.dir.path),
+    )
+    .unwrap();
+    assert_eq!(fs::read(folder.join("note.txt")).unwrap(), b"keep me\n");
+    assert_eq!(fs::read(&stray).unwrap(), b"crash leftover\n");
+
+    fs::remove_file(&stray).unwrap();
+    proxy.lock("Photos").await.unwrap();
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("saved.txt"), b"while locked\n").unwrap();
+    let error = proxy.unlock("Photos").await.unwrap_err().to_string();
+    assert!(error.contains("already exists and is not empty"), "{error}");
+    assert_eq!(
+        fs::read(folder.join("saved.txt")).unwrap(),
+        b"while locked\n"
+    );
+}
+
+#[tokio::test]
+async fn a_replaced_helper_binary_still_locks_on_stop() {
+    if rerun_with_unit_caps("a_replaced_helper_binary_still_locks_on_stop") {
+        return;
+    }
+    let helper = helper_binary();
+    let dir = std::env::temp_dir().join(format!("lve-upgrade-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let copy = dir.join("linux-vault-helper");
+    fs::copy(&helper, &copy).unwrap();
+    let mut mode = fs::metadata(&copy).unwrap().permissions();
+    mode.set_mode(0o711);
+    fs::set_permissions(&copy, mode).unwrap();
+    let mut child = std::process::Command::new(&copy)
+        .env("LVE_UPGRADE_PROBE", "1")
+        .env("LVE_PROBE_DIR", &dir)
+        .env("LVE_UNIT_CAPS", "1")
+        .env_remove("LVE_HELPER_BIN")
+        .env_remove("CARGO_BIN_EXE_linux_vault_helper")
+        .spawn()
+        .unwrap();
+    let ready = dir.join("ready");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("probe exited early: {status}");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("probe did not become ready");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let replacement = dir.join("linux-vault-helper.new");
+    fs::copy(&helper, &replacement).unwrap();
+    fs::rename(&replacement, &copy).unwrap();
+    fs::write(dir.join("go"), b"go\n").unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "probe failed: {status}");
+    assert_eq!(fs::read(dir.join("result")).unwrap(), b"ok\n");
+    assert!(dir.join("Photos.7z").is_file());
+    assert!(!dir.join("Photos").exists());
+}
+
+#[tokio::test]
+async fn nested_vaults_are_refused_and_a_shared_prefix_is_not() {
+    if rerun_with_unit_caps("nested_vaults_are_refused_and_a_shared_prefix_is_not") {
+        return;
+    }
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let outer = session.dir.path.join("Outer");
+    proxy.create(outer.to_str().unwrap()).await.unwrap();
+    let inside = proxy
+        .create(outer.join("Inner").to_str().unwrap())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        inside.contains("Cannot create Inner: it is inside vault Outer."),
+        "{inside}"
+    );
+
+    let holder = session.dir.path.join("Holder");
+    fs::create_dir(&holder).unwrap();
+    proxy
+        .create(holder.join("Inner").to_str().unwrap())
+        .await
+        .unwrap();
+    let contains = proxy
+        .create(holder.to_str().unwrap())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        contains.contains("Cannot create Holder: it contains vault Inner."),
+        "{contains}"
+    );
+
+    let forge = session.dir.path.join("Forge");
+    let forge2 = session.dir.path.join("Forge2");
+    proxy.create(forge.to_str().unwrap()).await.unwrap();
+    proxy.create(forge2.to_str().unwrap()).await.unwrap();
+    let names = proxy
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|vault| vault.name)
+        .collect::<Vec<_>>();
+    assert!(names.iter().any(|name| name == "Forge"), "{names:?}");
+    assert!(names.iter().any(|name| name == "Forge2"), "{names:?}");
+    assert!(names.iter().any(|name| name == "Inner"), "{names:?}");
+    assert!(!names.iter().any(|name| name == "Holder"), "{names:?}");
+
+    let home = TempDir::new();
+    let outer_old = home.path.join("Outer");
+    let inner_old = outer_old.join("Inner");
+    fs::create_dir_all(&inner_old).unwrap();
+    fs::write(outer_old.join("note.txt"), b"outer\n").unwrap();
+    fs::write(inner_old.join("note.txt"), b"inner\n").unwrap();
+    let registry = home.path.join("registry");
+    write_registry(
+        &registry,
+        &[
+            vault_line(caller_uid(), "Outer", &outer_old, "unlocked", None),
+            vault_line(caller_uid(), "Inner", &inner_old, "unlocked", None),
+        ],
+    );
+    let kept = start_and_list(&home.path, &registry, false).await;
+    assert!(kept.iter().any(|vault| vault.name == "Outer"), "{kept:?}");
+    assert!(kept.iter().any(|vault| vault.name == "Inner"), "{kept:?}");
+    assert_eq!(fs::read(outer_old.join("note.txt")).unwrap(), b"outer\n");
+    assert_eq!(fs::read(inner_old.join("note.txt")).unwrap(), b"inner\n");
+}
+
+#[tokio::test]
+async fn a_damaged_registry_refuses_every_operation_until_restart() {
+    if rerun_with_unit_caps("a_damaged_registry_refuses_every_operation_until_restart") {
+        return;
+    }
+    refuse_damaged_bytes(b"{not json").await;
+    refuse_damaged_bytes(br#"{"version":1,"vaults":[]}"#).await;
+
+    let home = TempDir::new();
+    let kept = home.path.join("Kept");
+    fs::create_dir(&kept).unwrap();
+    fs::write(kept.join("note.txt"), b"kept\n").unwrap();
+    let registry = home.path.join("registry");
+    write_registry(
+        &registry,
+        &[vault_line(caller_uid(), "Kept", &kept, "unlocked", None)],
+    );
+    let names = start_and_list(&home.path, &registry, false).await;
+    assert_eq!(
+        names
+            .iter()
+            .map(|vault| vault.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Kept"]
+    );
+    let saved = fs::read(registry.join("registry.json")).unwrap();
+    fs::write(registry.join("registry.json"), b"{not json").unwrap();
+    let broken = broken_helper(&home.path, &registry).await;
+    broken.shutdown.shut_down().await;
+    assert!(!registry.join("registry.json").exists());
+    assert_eq!(fs::read(kept.join("note.txt")).unwrap(), b"kept\n");
+    drop(broken);
+    let damaged = registry.join("registry.damaged");
+    let aside = fs::read_to_string(&damaged).unwrap();
+    assert!(aside.contains("registry.json.broken-"), "{aside}");
+    fs::remove_file(&damaged).unwrap();
+    fs::write(registry.join("registry.json"), &saved).unwrap();
+    let names = start_and_list(&home.path, &registry, false).await;
+    assert_eq!(
+        names
+            .iter()
+            .map(|vault| vault.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Kept"]
+    );
+}
+
+async fn refuse_damaged_bytes(bytes: &[u8]) {
+    let home = TempDir::new();
+    let registry = home.path.join("registry");
+    fs::create_dir_all(&registry).unwrap();
+    fs::write(registry.join("registry.json"), bytes).unwrap();
+    let helper = broken_helper(&home.path, &registry).await;
+    assert!(!registry.join("registry.json").exists());
+    let broken: Vec<_> = fs::read_dir(&registry)
+        .unwrap()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("registry.json.broken-")
+        })
+        .collect();
+    assert_eq!(broken.len(), 1);
+    assert_eq!(fs::read(broken[0].path()).unwrap(), bytes);
+    helper.shutdown.shut_down().await;
+    assert!(!registry.join("registry.json").exists());
+}
+
+struct BrokenHelper {
+    shutdown: linux_vault_helper::ShutdownHandle,
+    _server: zbus::Connection,
+}
+
+async fn broken_helper(home: &Path, registry: &Path) -> BrokenHelper {
+    let vaults = Vaults::open(registry, home).unwrap();
+    let helper = Helper::new(
+        Authorizer::Allow,
+        vaults,
+        Prompt::Program(vec!["/bin/false".into()]),
+        account(home),
+    );
+    let helper = match helper {
+        Ok(helper) => helper,
+        Err(error) => panic!("helper did not start: {error}"),
+    };
+    let shutdown = helper.shutdown_handle();
+    let guid = Guid::generate();
+    let (client_stream, server_stream) = UnixStream::pair().unwrap();
+    let server = Builder::unix_stream(server_stream)
+        .server(guid)
+        .unwrap()
+        .p2p()
+        .serve_at(OBJECT_PATH, helper)
+        .unwrap()
+        .build();
+    let client = Builder::unix_stream(client_stream).p2p().build();
+    let (client, server) = tokio::try_join!(client, server).unwrap();
+    let error = proxy(&client).await.list().await.unwrap_err().to_string();
+    assert!(
+        error.contains("org.linuxvault.Error.RegistryBroken"),
+        "{error}"
+    );
+    assert!(error.contains("registry.json.broken-"), "{error}");
+    let create = proxy(&client)
+        .await
+        .create(home.join("Other").to_str().unwrap())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        create.contains("org.linuxvault.Error.RegistryBroken"),
+        "{create}"
+    );
+    BrokenHelper {
+        shutdown,
+        _server: server,
+    }
+}
+
+#[tokio::test]
+async fn one_vault_failing_to_reconcile_does_not_stop_the_helper() {
+    if std::env::var_os("LVE_UNIT_CAPS").is_some() {
+        linux_vault_helper::limit_to_unit_capabilities();
+        missing_parent_still_starts().await;
+        undeletable_subfolder_still_starts().await;
+        deleted_owner_still_starts().await;
+        filesystem_without_immutable_still_starts().await;
+        return;
+    }
+    // Mount before the child drops capabilities. The guard unmounts on return
+    // and on panic, including the watchdog panic after the child is killed.
+    let mounted = prepare_vfat_mount();
+    let tmp = PathBuf::from("/var/tmp/lve-cursor-tests");
+    fs::create_dir_all(&tmp).unwrap();
+    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o1777)).unwrap();
+    let results = tmp.join(format!("lve-h2-triggers-{}", process::id()));
+    fs::write(&results, b"").unwrap();
+    let (helper, _staged) = stage_outside_home(&helper_binary());
+    let output = supervised_forwarding({
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "one_vault_failing_to_reconcile_does_not_stop_the_helper",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("LVE_UNIT_CAPS", "1")
+            .env("TMPDIR", &tmp)
+            .env("LVE_HELPER_BIN", &helper)
+            .env("LVE_TRIGGER_RESULTS", &results);
+        if let Some(mount) = &mounted {
+            command.env("LVE_FLAGLESS_MOUNT", &mount.path);
+        }
+        command
+    });
+    let text = String::from_utf8_lossy(&output.stderr);
+    let out = String::from_utf8_lossy(&output.stdout);
+    let recorded = fs::read_to_string(&results).unwrap_or_default();
+    let mut reported = true;
+    for name in [
+        "missing-parent",
+        "undeletable-subfolder",
+        "deleted-owner",
+        "vfat-no-immutable",
+    ] {
+        match recorded
+            .lines()
+            .find(|line| line.starts_with(&format!("{name}:")))
+        {
+            Some(line) => println!("trigger {line}"),
+            None => {
+                println!("trigger {name}: did not report");
+                reported = false;
+            }
+        }
+    }
+    let _ = std::io::stdout().flush();
+    assert!(
+        output.status.success() && reported,
+        "limited-capability child failed: {}\n{out}{text}",
+        output.status
+    );
+}
+
+async fn missing_parent_still_starts() {
+    let home = TempDir::new();
+    let good = home.path.join("Good");
+    fs::create_dir(&good).unwrap();
+    fs::write(good.join("note.txt"), b"kept\n").unwrap();
+    let parent = home.path.join("missing");
+    fs::create_dir(&parent).unwrap();
+    let orphan = parent.join("Orphan");
+    write_registry(
+        &home.path.join("registry"),
+        &[
+            vault_line(caller_uid(), "Good", &good, "unlocked", None),
+            vault_line(caller_uid(), "Orphan", &orphan, "unlocked", None),
+        ],
+    );
+    fs::remove_dir_all(&parent).unwrap();
+    let names = start_and_list(&home.path, &home.path.join("registry"), false).await;
+    assert!(names.iter().any(|vault| vault.name == "Good"), "{names:?}");
+    assert_eq!(fs::read(good.join("note.txt")).unwrap(), b"kept\n");
+    assert_eq!(
+        vault_state(&home.path.join("registry"), &home.path, "Orphan"),
+        linux_vault::State::NeedsRecovery
+    );
+    record_trigger("missing-parent", "ran, passed");
+}
+
+async fn undeletable_subfolder_still_starts() {
+    let home = TempDir::new();
+    let good = home.path.join("Good");
+    fs::create_dir(&good).unwrap();
+    fs::write(good.join("note.txt"), b"kept\n").unwrap();
+    let bad = home.path.join("Bad");
+    let frozen = bad.join("frozen");
+    fs::create_dir_all(&frozen).unwrap();
+    fs::write(bad.join("note.txt"), b"plain\n").unwrap();
+    fs::write(frozen.join("keep.txt"), b"stay\n").unwrap();
+    fs::set_permissions(&frozen, fs::Permissions::from_mode(0o555)).unwrap();
+    let archive = home.path.join("Bad.7z");
+    fs::write(&archive, b"archive\n").unwrap();
+    let identity = linux_vault::ArchiveId::capture(&archive).unwrap();
+    write_registry(
+        &home.path.join("registry"),
+        &[
+            vault_line(caller_uid(), "Good", &good, "unlocked", None),
+            vault_line(caller_uid(), "Bad", &bad, "locking", Some(&identity)),
+        ],
+    );
+    let names = start_and_list(&home.path, &home.path.join("registry"), false).await;
+    assert!(names.iter().any(|vault| vault.name == "Good"), "{names:?}");
+    assert_eq!(fs::read(frozen.join("keep.txt")).unwrap(), b"stay\n");
+    assert_eq!(fs::read(&archive).unwrap(), b"archive\n");
+    assert_eq!(
+        vault_state(&home.path.join("registry"), &home.path, "Bad"),
+        linux_vault::State::NeedsRecovery
+    );
+    record_trigger("undeletable-subfolder", "ran, passed");
+}
+
+async fn deleted_owner_still_starts() {
+    // `/root` is mode 550. Root without CAP_DAC_OVERRIDE cannot create a
+    // directory there, so the good vault stays in this temp home. Gone is
+    // outside every password-database home and does not exist, which is what
+    // owner_for sees after the owner has been deleted.
+    let home = TempDir::new();
+    let good = home.path.join("Good");
+    fs::create_dir(&good).unwrap();
+    fs::write(good.join("note.txt"), b"kept\n").unwrap();
+    let gone = PathBuf::from(format!("/lve-missing-owner-{}/Vault", process::id()));
+    let registry = home.path.join("registry");
+    write_registry(
+        &registry,
+        &[
+            vault_line(caller_uid(), "Good", &good, "unlocked", None),
+            vault_line(caller_uid(), "Gone", &gone, "unlocked", None),
+        ],
+    );
+    let names = start_and_list(&home.path, &registry, false).await;
+    assert!(names.iter().any(|vault| vault.name == "Good"), "{names:?}");
+    assert_eq!(fs::read(good.join("note.txt")).unwrap(), b"kept\n");
+    assert_eq!(
+        vault_state(&registry, &home.path, "Gone"),
+        linux_vault::State::NeedsRecovery
+    );
+    record_trigger("deleted-owner", "ran, passed");
+}
+
+async fn filesystem_without_immutable_still_starts() {
+    let Some(mounted) = std::env::var_os("LVE_FLAGLESS_MOUNT").filter(|path| !path.is_empty())
+    else {
+        eprintln!("filesystem without the immutable flag: skipped, vfat mount was not available");
+        record_trigger("vfat-no-immutable", "skipped (mount refused)");
+        return;
+    };
+    let mounted = PathBuf::from(mounted);
+    let scratch = TempDir::new();
+    let good = mounted.join("Good");
+    fs::create_dir(&good).unwrap();
+    fs::write(good.join("note.txt"), b"kept\n").unwrap();
+    let archive = mounted.join("Photos.7z");
+    fs::write(&archive, b"archive\n").unwrap();
+    let identity = linux_vault::ArchiveId::capture(&archive).unwrap();
+    let folder = mounted.join("Photos");
+    write_registry(
+        &scratch.path.join("registry"),
+        &[
+            vault_line(caller_uid(), "Good", &good, "unlocked", None),
+            vault_line(caller_uid(), "Photos", &folder, "locked", Some(&identity)),
+        ],
+    );
+    let log_path = scratch.path.join("helper-log");
+    let log_file = fs::File::create(&log_path).unwrap();
+    let saved = unsafe { nix::libc::dup(2) };
+    assert!(saved >= 0);
+    assert!(unsafe { nix::libc::dup2(log_file.as_raw_fd(), 2) } >= 0);
+    let listed = start_and_list(&mounted, &scratch.path.join("registry"), false).await;
+    assert!(unsafe { nix::libc::dup2(saved, 2) } >= 0);
+    unsafe { nix::libc::close(saved) };
+    drop(log_file);
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        listed.iter().any(|vault| vault.name == "Good"),
+        "{listed:?}"
+    );
+    assert_eq!(fs::read(good.join("note.txt")).unwrap(), b"kept\n");
+    assert_eq!(fs::read(&archive).unwrap(), b"archive\n");
+    assert_eq!(
+        vault_state(&scratch.path.join("registry"), &mounted, "Photos"),
+        linux_vault::State::Locked
+    );
+    let photos = listed
+        .iter()
+        .find(|vault| vault.name == "Photos")
+        .expect("Photos was not listed");
+    assert_eq!(photos.state, "locked (not immutable)", "{listed:?}");
+    assert!(
+        log.lines().any(|line| {
+            line.starts_with("<3>") && line.contains("Photos") && line.contains("immutable")
+        }),
+        "{log}"
+    );
+    let listed_flag = lsattr_text(&archive);
+    assert!(
+        !listed_flag.contains('i'),
+        "immutable flag stuck on {archive:?}: {listed_flag}"
+    );
+    // The seal line was diverted into `log` while stderr was captured. Put it
+    // back on stderr so the parent can forward it.
+    eprintln!("{log}");
+    record_trigger("vfat-no-immutable", "ran, passed");
+}
+
+fn record_trigger(name: &str, result: &str) {
+    let Some(path) = std::env::var_os("LVE_TRIGGER_RESULTS") else {
+        return;
+    };
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    writeln!(file, "{name}: {result}").unwrap();
+    file.flush().unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_locks_a_vault_stuck_in_locking() {
+    if rerun_with_unit_caps("shutdown_locks_a_vault_stuck_in_locking") {
+        return;
+    }
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let folder = session.dir.path.join("Forge");
+    proxy.create(folder.to_str().unwrap()).await.unwrap();
+    fs::write(folder.join("note.txt"), b"held\n").unwrap();
+    let stuck = session.dir.path.join("Stuck");
+    proxy.create(stuck.to_str().unwrap()).await.unwrap();
+    fs::write(stuck.join("note.txt"), b"plain\n").unwrap();
+    let frozen = stuck.join("frozen");
+    fs::create_dir(&frozen).unwrap();
+    fs::write(frozen.join("keep.txt"), b"stay\n").unwrap();
+    fs::set_permissions(&frozen, fs::Permissions::from_mode(0o555)).unwrap();
+    let vaults = Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap();
+    vaults
+        .set_state(caller_uid(), "Forge", linux_vault::State::Locking)
+        .unwrap();
+    vaults
+        .set_state(caller_uid(), "Stuck", linux_vault::State::Locking)
+        .unwrap();
+    session.shutdown.shut_down().await;
+    assert!(session.dir.path.join("Forge.7z").is_file());
+    assert!(!folder.exists());
+    assert_eq!(fs::read(frozen.join("keep.txt")).unwrap(), b"stay\n");
+    let vaults = Vaults::open(session.dir.path.join("registry"), &session.dir.path).unwrap();
+    assert_eq!(
+        vaults.get("Forge").unwrap().state,
+        linux_vault::State::Locked
+    );
+    assert!(stuck.is_dir());
+}
+
+struct FlaglessMount {
+    path: PathBuf,
+    scratch: PathBuf,
+    reaper: std::process::Child,
+}
+
+impl Drop for FlaglessMount {
+    fn drop(&mut self) {
+        if unmount(&self.path) {
+            let _ = self.reaper.kill();
+            let _ = self.reaper.wait();
+            let _ = fs::remove_dir_all(&self.scratch);
+        }
+    }
+}
+
+/// Mount a vfat image. vfat does not implement the immutable flag at all.
+///
+/// This runs in the parent, which still has full root. ext2 through fuse2fs
+/// accepted the flag, so sealing succeeded and nothing was logged. Returns
+/// nothing when vfat cannot be mounted, so that trigger is skipped.
+fn prepare_vfat_mount() -> Option<FlaglessMount> {
+    if std::process::Command::new("mkfs.vfat")
+        .arg("--help")
+        .output()
+        .is_err()
+    {
+        eprintln!("filesystem without the immutable flag: skipped, mkfs.vfat is not available");
+        return None;
+    }
+    let scratch = PathBuf::from(format!(
+        "/var/tmp/lve-cursor-tests/lve-vfat-{}",
+        process::id()
+    ));
+    if let Err(error) = fs::create_dir_all(&scratch) {
+        eprintln!(
+            "filesystem without the immutable flag: skipped, could not create {}: {error}",
+            scratch.display()
+        );
+        return None;
+    }
+    let image = scratch.join("fs.img");
+    let path = scratch.join("mnt");
+    let _ = fs::create_dir(&path);
+    let image_ready = std::process::Command::new("truncate")
+        .args(["-s", "32M"])
+        .arg(&image)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+        && std::process::Command::new("mkfs.vfat")
+            .args(["-n", "LVE"])
+            .arg(&image)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+    if !image_ready {
+        eprintln!("filesystem without the immutable flag: skipped, could not create a vfat image");
+        let _ = fs::remove_dir_all(&scratch);
+        return None;
+    }
+    // umask=000 so a worker running as a normal user can read the archive.
+    let mounted = std::process::Command::new("mount")
+        .args(["-t", "vfat", "-o", "loop,uid=0,gid=0,umask=000"])
+        .arg(&image)
+        .arg(&path)
+        .output();
+    match mounted {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "filesystem without the immutable flag: skipped, vfat mount failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let _ = fs::remove_dir_all(&scratch);
+            return None;
+        }
+        Err(error) => {
+            eprintln!(
+                "filesystem without the immutable flag: skipped, mount could not be started: {error}"
+            );
+            let _ = fs::remove_dir_all(&scratch);
+            return None;
+        }
+    }
+    Some(FlaglessMount {
+        reaper: spawn_unmount_reaper(&path),
+        path,
+        scratch,
+    })
+}
+
+/// Attribute letters from `lsattr`, or empty when the filesystem rejects the ioctl.
+fn lsattr_text(path: &Path) -> String {
+    let output = match std::process::Command::new("lsattr").arg(path).output() {
+        Ok(output) => output,
+        Err(_) => return String::new(),
+    };
+    if !output.status.success() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+fn unmount(path: &Path) -> bool {
+    for args in [["fusermount3", "-u"], ["fusermount", "-u"], ["umount", ""]] {
+        let mut command = std::process::Command::new(args[0]);
+        if !args[1].is_empty() {
+            command.arg(args[1]);
+        }
+        if command
+            .arg(path)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Unmounts after this process is gone, including a watchdog SIGKILL, which
+/// does not run `Drop`.
+fn spawn_unmount_reaper(mount: &Path) -> std::process::Child {
+    let script = r#"
+import os, sys, time, subprocess
+parent = int(sys.argv[1])
+mount = sys.argv[2]
+while True:
+    try:
+        os.kill(parent, 0)
+    except OSError:
+        break
+    time.sleep(0.2)
+for cmd in (
+    ["fusermount3", "-u", mount],
+    ["fusermount", "-u", mount],
+    ["umount", mount],
+):
+    try:
+        if subprocess.call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
+            break
+    except FileNotFoundError:
+        pass
+"#;
+    let mut command = std::process::Command::new("python3");
+    command
+        .arg("-c")
+        .arg(script)
+        .arg(process::id().to_string())
+        .arg(mount)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command.spawn().unwrap()
+}
+
+fn vault_line(
+    uid: u32,
+    name: &str,
+    path: &Path,
+    state: &str,
+    archive: Option<&linux_vault::ArchiveId>,
+) -> String {
+    let archive = match archive {
+        None => "null".to_string(),
+        Some(identity) => format!(
+            "{{\"dev\":{},\"ino\":{},\"size\":{},\"mtime_sec\":{},\"mtime_nsec\":{}}}",
+            identity.dev, identity.ino, identity.size, identity.mtime_sec, identity.mtime_nsec
+        ),
+    };
+    format!(
+        "{{\"uid\":{uid},\"name\":{},\"path\":{},\"state\":{},\"archive\":{archive}}}",
+        json_string(name),
+        json_string(&path.display().to_string()),
+        json_string(state),
+    )
+}
+
+fn json_string(text: &str) -> String {
+    format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn write_registry(dir: &Path, vaults: &[String]) {
+    fs::create_dir_all(dir).unwrap();
+    let body = format!(
+        "{{\n  \"version\": 2,\n  \"vaults\": [\n    {}\n  ]\n}}\n",
+        vaults.join(",\n    ")
+    );
+    fs::write(dir.join("registry.json"), body).unwrap();
+}
+
+fn vault_state(registry: &Path, root: &Path, name: &str) -> linux_vault::State {
+    Vaults::open(registry, root)
+        .unwrap()
+        .get(name)
+        .unwrap()
+        .state
+}
+
+async fn start_and_list(home: &Path, registry: &Path, passwd: bool) -> Vec<VaultStatus> {
+    let vaults = Vaults::open(registry, home).unwrap();
+    let prompt = Prompt::Program(vec!["/bin/false".into()]);
+    let helper = if passwd {
+        Helper::for_passwd(Authorizer::Allow, vaults, prompt)
+    } else {
+        Helper::new(Authorizer::Allow, vaults, prompt, account(home))
+    };
+    let helper = match helper {
+        Ok(helper) => helper,
+        Err(error) => panic!("helper did not start: {error}"),
+    };
+    let guid = Guid::generate();
+    let (client_stream, server_stream) = UnixStream::pair().unwrap();
+    let server = Builder::unix_stream(server_stream)
+        .server(guid)
+        .unwrap()
+        .p2p()
+        .serve_at(OBJECT_PATH, helper)
+        .unwrap()
+        .build();
+    let client = Builder::unix_stream(client_stream).p2p().build();
+    let (client, _server) = tokio::try_join!(client, server).unwrap();
+    proxy(&client).await.list().await.unwrap()
 }

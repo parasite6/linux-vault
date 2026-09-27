@@ -9,6 +9,9 @@ RequiresMountsFor=/home
 [Service]
 Type=dbus
 BusName=org.linuxvault.Helper
+# SIGTERM goes to the main process only. A 7z that is already packing is
+# left to finish instead of being killed with the rest of the cgroup.
+KillMode=mixed
 ExecStart=/usr/libexec/linux-vault-helper
 Restart=on-failure
 # stderr is the journal. A `<7>` prefix is syslog debug, on every line, and

@@ -394,7 +394,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "linux-vault"
-version = "0.1.4"
+version = "0.1.8"
 dependencies = [
  "libc",
  "serde",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "linux-vault-dbus"
-version = "0.1.4"
+version = "0.1.8"
 dependencies = [
  "serde",
  "zbus",
@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "linux-vault-helper"
-version = "0.1.4"
+version = "0.1.8"
 dependencies = [
  "futures-util",
  "linux-keyutils",
@@ -426,7 +426,7 @@ dependencies = [
 
 [[package]]
 name = "linux-vault-lve"
-version = "0.1.4"
+version = "0.1.8"
 dependencies = [
  "linux-vault",
  "linux-vault-dbus",

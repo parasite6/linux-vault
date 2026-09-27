@@ -17,6 +17,8 @@ mod open_files;
 mod pinentry;
 mod polkit;
 mod shutdown;
+mod upgrade;
+pub use upgrade::replaced_binary_probe;
 mod worker;
 
 use std::ffi::{CStr, OsString};
@@ -157,6 +159,9 @@ pub struct Helper {
     workers: Arc<Mutex<Vec<u32>>>,
     /// Test seam. Runs after the ownership check and before a registry write.
     before_mutation: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
+    /// Set at startup when `registry.json` could not be read. Every method
+    /// returns this text until the process is restarted.
+    registry_fault: Arc<Mutex<Option<String>>>,
 }
 
 impl Helper {
@@ -200,6 +205,7 @@ impl Helper {
         let inhibit = ShutdownHandle::inhibit();
         let passphrases = HeldPassphrases::new()?;
         let workers = Arc::new(Mutex::new(Vec::new()));
+        let registry_fault = Arc::new(Mutex::new(None));
         let shutdown = ShutdownHandle::new(
             Arc::clone(&gate),
             cancel.clone(),
@@ -209,6 +215,7 @@ impl Helper {
             Arc::new(tokio::sync::Mutex::new(())),
             Arc::new(AtomicUsize::new(0)),
             Arc::clone(&workers),
+            Arc::clone(&registry_fault),
         );
         let helper = Self {
             authorizer,
@@ -222,6 +229,7 @@ impl Helper {
             shutdown,
             workers,
             before_mutation: std::sync::Mutex::new(None),
+            registry_fault: Arc::clone(&registry_fault),
         };
         helper.reconcile_with_workers()?;
         Ok(helper)
@@ -248,53 +256,55 @@ impl Helper {
         }
     }
 
+    fn registry_allows(&self) -> Result<(), HelperError> {
+        let message = self
+            .registry_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match message {
+            Some(message) => Err(HelperError::RegistryBroken(message)),
+            None => Ok(()),
+        }
+    }
+
     /// One worker per user. The worker checks filenames; this process writes
     /// the registry and sets the immutable flag on archives that remain.
     fn reconcile_with_workers(&self) -> Result<(), HelperError> {
-        let listed = self
-            .vaults
-            .list()
-            .map_err(|error| vault_error("reconciling", "registry", error))?;
-        let mut groups: Vec<(Account, Vec<linux_vault::Vault>)> = Vec::new();
-        for vault in listed {
-            let account = self.owner_for(&vault.path)?;
-            if let Some(group) = groups
-                .iter_mut()
-                .find(|(owner, _)| owner.uid == account.uid)
-            {
-                group.1.push(vault);
-            } else {
-                groups.push((account, vec![vault]));
+        let listed = match self.vaults.list() {
+            Ok(listed) => listed,
+            Err(linux_vault::Error::RegistryDamaged(message)) => {
+                eprintln!("<3>linux-vault-helper: {message}");
+                *self
+                    .registry_fault
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(message);
+                return Ok(());
             }
-        }
-        for (account, vaults) in groups {
-            let mut worker = worker::HomeWorker::spawn(
-                account.uid,
-                account.gid,
-                &account.home,
-                self.vaults.share(),
-                Arc::clone(&self.workers),
-            )?;
-            for vault in vaults {
-                let facts = worker.inspect(&vault.path)?;
-                if !facts.folder && !facts.archive {
-                    self.vaults
-                        .unregister(vault.uid, &vault.name)
-                        .map_err(|error| vault_error("reconciling", &vault.name, error))?;
-                    drop_bookmark(&mut worker, &vault.path, &vault.name);
+            Err(error) => return Err(vault_error("reconciling", "registry", error)),
+        };
+        warn_about_nested(&listed);
+        for vault in listed {
+            let account = match self.owner_for(&vault.path) {
+                Ok(account) => account,
+                Err(error) => {
+                    eprintln!("<3>linux-vault-helper: reconciling {}: {error}", vault.name);
+                    let _ = self.vaults.mark_needs_recovery(vault.uid, &vault.name);
                     continue;
                 }
-                let state = if facts.archive {
-                    linux_vault::State::Locked
-                } else {
-                    linux_vault::State::NeedsRecovery
-                };
-                self.vaults
-                    .set_state(vault.uid, &vault.name, state)
-                    .map_err(|error| vault_error("reconciling", &vault.name, error))?;
-                if facts.archive {
-                    worker.seal(&vault.path)?;
-                }
+            };
+            if let Err(error) = reconcile_from_disk(
+                &self.vaults,
+                &self.passphrases,
+                vault.uid,
+                account.gid,
+                &account.home,
+                &vault.path,
+                &vault.name,
+                &self.workers,
+            ) {
+                eprintln!("<3>linux-vault-helper: reconciling {}: {error}", vault.name);
+                let _ = self.vaults.mark_needs_recovery(vault.uid, &vault.name);
             }
         }
         Ok(())
@@ -444,6 +454,44 @@ impl Helper {
         }
     }
 
+    async fn refuse_stray_archive(
+        &self,
+        account: &Account,
+        path: &Path,
+        name: &str,
+        verb: &str,
+    ) -> Result<(), HelperError> {
+        let facts = self.inspect_with(account, path, name).await?;
+        if facts.archive {
+            let archive = path.with_file_name(format!("{name}.7z"));
+            return Err(HelperError::Failed(format!(
+                "Cannot {verb} {name}: {} already exists and is not this vault's archive.",
+                archive.display()
+            )));
+        }
+        Ok(())
+    }
+
+    async fn inspect_with(
+        &self,
+        account: &Account,
+        path: &Path,
+        name: &str,
+    ) -> Result<linux_vault::FilenameFacts, HelperError> {
+        let uid = account.uid;
+        let gid = account.gid;
+        let home = account.home.clone();
+        let vaults = self.vaults.share();
+        let check = path.to_path_buf();
+        let live = Arc::clone(&self.workers);
+        tokio::task::spawn_blocking(move || {
+            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, live)?;
+            worker.inspect(&check)
+        })
+        .await
+        .map_err(|error| failed("locking", name, error))?
+    }
+
     async fn files_are_open(
         &self,
         uid: u32,
@@ -521,6 +569,7 @@ impl Helper {
     ) -> Result<(), HelperError> {
         let _flight = self.gate.enter()?;
         let caller = self.gate(connection, &header).await?;
+        self.registry_allows()?;
         let account = self.account_of(&caller)?;
         let name = folder_name(path)?;
         let _guard = self.locks.acquire(account.uid, &name).await;
@@ -545,9 +594,25 @@ impl Helper {
             if canonical != home && !canonical.starts_with(&home) {
                 return Err(failed("creating", &path, "vault path is outside the home"));
             }
-            let created = vaults
-                .register_unlocked(uid, &canonical)
-                .map_err(|error| failed("creating", &canonical.display().to_string(), error))?;
+            let facts = worker.inspect(&canonical)?;
+            if facts.archive {
+                let archive = canonical.with_extension("7z");
+                return Err(HelperError::Failed(format!(
+                    "Cannot create {}: {} already exists and is not this vault's archive.",
+                    canonical
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("vault"),
+                    archive.display()
+                )));
+            }
+            let created =
+                vaults
+                    .register_unlocked(uid, &canonical)
+                    .map_err(|error| match &error {
+                        linux_vault::Error::Nested { .. } => HelperError::Nested(error.to_string()),
+                        _ => failed("creating", &canonical.display().to_string(), error),
+                    })?;
             keep_bookmark(&mut worker, &canonical, &created.name);
             Ok(created)
         })
@@ -566,6 +631,7 @@ impl Helper {
     ) -> Result<(), HelperError> {
         let _flight = self.gate.enter()?;
         let caller = self.gate(connection, &header).await?;
+        self.registry_allows()?;
         let account = self.account_of(&caller)?;
         if !plain_vault_name(name) {
             return Err(failed(
@@ -586,6 +652,34 @@ impl Helper {
         }
         let path = vault.path.clone();
         self.refuse_if_empty(&account, &path, name).await?;
+        self.refuse_stray_archive(&account, &path, name, "lock")
+            .await?;
+        // A missing key is needs_recovery even when the lock is then refused
+        // because a file is open. The refusal must not leave the vault looking
+        // unlocked after the passphrase is already gone.
+        let held = self.passphrases.read(account.uid, name);
+        if matches!(&held, Err(HelperError::Failed(message)) if passphrase_is_missing(message)) {
+            self.vaults
+                .mark_needs_recovery(account.uid, name)
+                .map_err(|error| vault_error("locking", name, error))?;
+        }
+        self.files_are_open(account.uid, account.gid, &account.home, &path, name)
+            .await?;
+        let (passphrase, recovery) = match held {
+            Ok(passphrase) => (passphrase, false),
+            Err(HelperError::Failed(message)) if passphrase_is_missing(&message) => {
+                let pinentry = self.pinentry_for(&account)?;
+                let prompt = self.cancel.child();
+                let typed = pinentry
+                    .ask(Purpose::Recovery, name, &prompt)
+                    .await
+                    .map_err(|error| named_pin("asking for the passphrase", name, error))?;
+                (typed, true)
+            }
+            Err(error) => return Err(error),
+        };
+        self.refuse_stray_archive(&account, &path, name, "lock")
+            .await?;
         self.before_mutation();
         let (_stored_path, _previous) = self
             .vaults
@@ -602,21 +696,6 @@ impl Helper {
             keys: self.passphrases.clone(),
             workers: Arc::clone(&self.workers),
         };
-        self.files_are_open(account.uid, account.gid, &account.home, &path, name)
-            .await?;
-        let (passphrase, recovery) = match self.passphrases.read(account.uid, name) {
-            Ok(passphrase) => (passphrase, false),
-            Err(HelperError::Failed(message)) if passphrase_is_missing(&message) => {
-                let pinentry = self.pinentry_for(&account)?;
-                let prompt = self.cancel.child();
-                let typed = pinentry
-                    .ask(Purpose::Recovery, name, &prompt)
-                    .await
-                    .map_err(|error| named_pin("asking for the passphrase", name, error))?;
-                (typed, true)
-            }
-            Err(error) => return Err(error),
-        };
         let supplied = !passphrase.as_bytes().is_empty();
         let path_kind = if recovery { "recovery" } else { "held" };
         if !supplied {
@@ -632,9 +711,24 @@ impl Helper {
         let pack_path = path.clone();
         let bookmark_name = name.to_string();
         let live = Arc::clone(&self.workers);
+        let record_uid = account.uid;
+        let record_name = name.to_string();
         let packed = tokio::task::spawn_blocking(move || {
-            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, live.clone())?;
-            worker.pack(&pack_path, passphrase.as_bytes())?;
+            let mut worker =
+                worker::HomeWorker::spawn(uid, gid, &home, vaults.share(), live.clone())?;
+            let identity = worker.pack(&pack_path, passphrase.as_bytes())?;
+            vaults
+                .record_archive(record_uid, &record_name, identity)
+                .map_err(|error| failed("locking", &record_name, error))?;
+            worker.delete_folder(&pack_path)?;
+            if let Err(error) = worker.seal(&pack_path) {
+                eprintln!(
+                    "<3>linux-vault-helper: sealing {record_name} for uid {record_uid}: {error}"
+                );
+                let _ = vaults.set_immutable(record_uid, &record_name, false);
+            } else {
+                let _ = vaults.set_immutable(record_uid, &record_name, true);
+            }
             keep_bookmark(&mut worker, &pack_path, &bookmark_name);
             Ok(())
         })
@@ -668,6 +762,7 @@ impl Helper {
     ) -> Result<(), HelperError> {
         let _flight = self.gate.enter()?;
         let caller = self.gate(connection, &header).await?;
+        self.registry_allows()?;
         let account = self.account_of(&caller)?;
         if !plain_vault_name(name) {
             return Err(failed(
@@ -686,6 +781,13 @@ impl Helper {
                 name,
                 format!("that is {}", vault.state),
             ));
+        }
+        let facts = self.inspect_with(&account, &vault.path, name).await?;
+        if facts.occupied {
+            return Err(HelperError::Failed(format!(
+                "Cannot unlock {name}: {} already exists and is not empty.",
+                vault.path.display()
+            )));
         }
         let pinentry = self.pinentry_for(&account)?;
         let prompt = self.cancel.child();
@@ -741,6 +843,7 @@ impl Helper {
     ) -> Result<Vec<VaultStatus>, HelperError> {
         let _flight = self.gate.enter()?;
         let caller = self.gate(connection, &header).await?;
+        self.registry_allows()?;
         self.gate.ensure_open()?;
         let account = self.account_of(&caller)?;
         let vaults = self.vaults_for(&account)?;
@@ -768,15 +871,18 @@ impl Helper {
             let mut kept = Vec::new();
             for vault in mine {
                 match worker.owner_of(&vault.path) {
-                    Ok(owner) if owner == uid => kept.push(VaultStatus {
-                        name: vault.name,
-                        path: vault.path.display().to_string(),
-                        state: state_wire(vault.state).to_string(),
-                    }),
+                    Ok(owner) if owner == uid => {
+                        let state = listed_state(&vault);
+                        kept.push(VaultStatus {
+                            name: vault.name,
+                            path: vault.path.display().to_string(),
+                            state,
+                        })
+                    }
                     Ok(_) => {}
-                    Err(HelperError::Failed(message))
-                        if message.contains("cannot see the owner") => {}
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        eprintln!("<3>linux-vault-helper: listing {}: {error}", vault.name);
+                    }
                 }
             }
             Ok(kept)
@@ -793,6 +899,7 @@ impl Helper {
     ) -> Result<(), HelperError> {
         let _flight = self.gate.enter()?;
         let caller = self.gate(connection, &header).await?;
+        self.registry_allows()?;
         let account = self.account_of(&caller)?;
         if !plain_vault_name(name) {
             return Err(failed(
@@ -869,6 +976,7 @@ impl Helper {
     ) -> Result<(), HelperError> {
         let _flight = self.gate.enter()?;
         let caller = self.gate(connection, &header).await?;
+        self.registry_allows()?;
         let account = self.account_of(&caller)?;
         if !plain_vault_name(name) {
             return Err(failed(
@@ -1032,12 +1140,35 @@ pub(crate) fn reconcile_from_disk(
         drop_bookmark(&mut worker, path, name);
         return Ok(());
     }
+    let recorded = vaults.archive_identity(uid, name).ok().flatten();
+    let proven = facts
+        .identity
+        .as_ref()
+        .is_some_and(|live| recorded.as_ref() == Some(live));
+    if facts.folder && facts.archive && !proven {
+        eprintln!(
+            "<3>linux-vault-helper: {name} and its archive both exist and the archive is not this vault's; deleted nothing"
+        );
+        vaults
+            .set_state(uid, name, State::NeedsRecovery)
+            .map_err(|error| vault_error("reconciling", name, error))?;
+        return Ok(());
+    }
+    if facts.folder && facts.archive && proven {
+        worker.delete_folder(path)?;
+    }
     if facts.archive {
+        if let Some(identity) = facts.identity.clone() {
+            let _ = vaults.record_archive(uid, name, identity);
+        }
         vaults
             .set_state(uid, name, State::Locked)
             .map_err(|error| vault_error("reconciling", name, error))?;
         if let Err(error) = worker.seal(path) {
-            eprintln!("linux-vault-helper: sealing {name} for uid {uid}: {error}");
+            eprintln!("<3>linux-vault-helper: sealing {name} for uid {uid}: {error}");
+            let _ = vaults.set_immutable(uid, name, false);
+        } else {
+            let _ = vaults.set_immutable(uid, name, true);
         }
         return Ok(());
     }
@@ -1078,15 +1209,18 @@ pub(crate) fn plain_archive_error(error: HelperError) -> HelperError {
     let HelperError::Failed(message) = &error else {
         return error;
     };
-    let lower = message.to_ascii_lowercase();
+    // Classify 7z's own text, not the vault path and not our "7z failed" wrapper.
+    // A killed 7z prints nothing; that is not an unreadable archive.
+    let lower = seven_zip_output(message).to_ascii_lowercase();
     let plain = if lower.contains("wrong password") || lower.contains("wrong passphrase") {
         HelperError::WrongPassphrase("wrong passphrase".into())
     } else if lower.contains("no space left")
         || lower.contains("not enough space")
+        || lower.contains("not enough disk space")
         || lower.contains("disk full")
         || lower.contains("os error 28")
     {
-        HelperError::Failed("not enough disk space".into())
+        HelperError::NoSpace("not enough disk space".into())
     } else if lower.contains("data error")
         || lower.contains("crc failed")
         || lower.contains("headers error")
@@ -1094,15 +1228,49 @@ pub(crate) fn plain_archive_error(error: HelperError) -> HelperError {
         || lower.contains("can not open the file as archive")
     {
         HelperError::Failed("the archive is damaged".into())
-    } else if lower.contains("7z failed") || lower.contains("7-zip") {
+    } else if !lower.is_empty() && (lower.contains("cannot open") || lower.contains("can not open"))
+    {
         HelperError::Failed("the archive could not be read".into())
     } else {
+        journal_debug(message);
         return error;
     };
     // Always written. systemd stores a `<7>` line at debug priority, with no
     // RUST_LOG check. `journalctl -u linux-vault-helper -p debug` shows it.
     journal_debug(message);
     plain
+}
+
+/// Text 7z itself wrote. Our wrapper is `7z failed (status …): ` and is not
+/// part of that text. An empty result means 7z was stopped before it spoke.
+fn seven_zip_output(message: &str) -> &str {
+    let text = seven_zip_text(message);
+    let Some(wrapped) = text.find("7z failed (") else {
+        return text;
+    };
+    text[wrapped..]
+        .split_once("): ")
+        .map(|(_, output)| output)
+        .unwrap_or("")
+}
+
+/// The helper prefixes worker failures with `step for path: `. The path is
+/// not part of 7z's output.
+fn seven_zip_text(message: &str) -> &str {
+    const PREFIXES: &[&str] = &[
+        "locking for ",
+        "unlocking for ",
+        "deleting the archive for ",
+        "deleting the folder for ",
+    ];
+    for prefix in PREFIXES {
+        if let Some(rest) = message.strip_prefix(prefix) {
+            if let Some((_, detail)) = rest.split_once(": ") {
+                return detail;
+            }
+        }
+    }
+    message
 }
 
 fn journal_debug(text: &str) {
@@ -1121,10 +1289,27 @@ fn debug_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
+fn warn_about_nested(vaults: &[linux_vault::Vault]) {
+    for (index, left) in vaults.iter().enumerate() {
+        for right in vaults.iter().skip(index + 1) {
+            if left.uid == right.uid && linux_vault::vaults_are_nested(&left.path, &right.path) {
+                eprintln!(
+                    "<4>linux-vault-helper: {} and {} are nested; leaving both as they are",
+                    left.name, right.name
+                );
+            }
+        }
+    }
+}
+
 fn vault_error(step: &str, target: &str, error: linux_vault::Error) -> HelperError {
-    match error {
+    match &error {
         linux_vault::Error::NotFound => vault_not_found(),
-        other => failed(step, target, other),
+        linux_vault::Error::RegistryDamaged(message) => {
+            HelperError::RegistryBroken(message.clone())
+        }
+        linux_vault::Error::Nested { .. } => HelperError::Nested(error.to_string()),
+        _ => failed(step, target, error),
     }
 }
 
@@ -1153,6 +1338,14 @@ fn folder_name(path: &str) -> Result<String, HelperError> {
         .filter(|name| plain_vault_name(name))
         .map(str::to_string)
         .ok_or_else(|| HelperError::Failed("vault path has no folder name".into()))
+}
+
+fn listed_state(vault: &linux_vault::Vault) -> String {
+    if vault.state == State::Locked && !vault.immutable {
+        "locked (not immutable)".to_string()
+    } else {
+        state_wire(vault.state).to_string()
+    }
 }
 
 fn state_wire(state: State) -> &'static str {
@@ -1317,6 +1510,12 @@ mod archive_errors {
         ));
         assert_eq!(damaged.description(), Some("the archive is damaged"));
         assert!(!damaged.to_string().contains("Forge.7z"));
+
+        let stopped = plain_archive_error(HelperError::Failed(
+            "unlocking for /home/me/Forge: 7z failed (status Some(1)): ".into(),
+        ));
+        assert!(stopped.to_string().contains("7z failed"), "{stopped}");
+        assert!(!stopped.to_string().contains("could not be read"));
     }
 
     #[test]

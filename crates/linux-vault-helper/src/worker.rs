@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use zeroize::Zeroize;
 
 use linux_vault::Vaults;
 use zeroize::Zeroizing;
@@ -123,20 +124,26 @@ pub fn run() -> i32 {
 }
 
 fn serve(mut sock: UnixStream) -> Result<(), String> {
-    let (home, seven_zip) = match read_frame(&mut sock) {
-        Ok((OK, body, _)) => {
-            let text = String::from_utf8_lossy(&body);
-            let mut parts = text.split('\0');
-            let home = PathBuf::from(parts.next().unwrap_or(""));
-            let seven_zip = parts
-                .next()
-                .filter(|path| !path.is_empty())
-                .map(PathBuf::from);
-            (home, seven_zip)
+    let pending = Arc::new(Mutex::new(Vec::new()));
+    let (home, seven_zip) = {
+        let mut pending = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match read_frame(&mut sock, &mut pending) {
+            Ok((OK, body, _)) => {
+                let text = String::from_utf8_lossy(&body);
+                let mut parts = text.split('\0');
+                let home = PathBuf::from(parts.next().unwrap_or(""));
+                let seven_zip = parts
+                    .next()
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from);
+                (home, seven_zip)
+            }
+            Ok((ERR, body, _)) => return Err(String::from_utf8_lossy(&body).into_owned()),
+            Ok(_) => return Err("worker expected a home path".into()),
+            Err(error) => return Err(error.to_string()),
         }
-        Ok((ERR, body, _)) => return Err(String::from_utf8_lossy(&body).into_owned()),
-        Ok(_) => return Err("worker expected a home path".into()),
-        Err(error) => return Err(error.to_string()),
     };
     write_frame(&mut sock, OK, &[], None)
         .map_err(|error| format!("starting worker for {}: {error}", home.display()))?;
@@ -157,16 +164,20 @@ fn serve(mut sock: UnixStream) -> Result<(), String> {
     let opened = opened.with_stop_flag(stop);
     let sock = Arc::new(Mutex::new(sock));
     let hook_sock = Arc::clone(&sock);
+    let hook_pending = Arc::clone(&pending);
     let vaults = opened.with_flag_hook(move |archive, set| {
         let mut guard = hook_sock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        send_flag(&mut guard, set, archive).map_err(linux_vault::Error::from)
+        send_flag(&mut guard, &hook_pending, set, archive).map_err(linux_vault::Error::from)
     });
     loop {
-        let (tag, body, _) = {
+        let (tag, mut body, _) = {
             let mut guard = sock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            match read_frame(&mut guard) {
+            let mut pending = pending
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match read_frame(&mut guard, &mut pending) {
                 Ok(frame) => frame,
                 Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
                 Err(error) => {
@@ -178,6 +189,7 @@ fn serve(mut sock: UnixStream) -> Result<(), String> {
             }
         };
         let result = dispatch(&vaults, &home, tag, &body);
+        body.zeroize();
         let mut guard = sock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Err(error) =
             result.and_then(|reply| write_frame(&mut guard, reply.0, &reply.1, None))
@@ -206,10 +218,10 @@ fn dispatch(vaults: &Vaults, home: &Path, tag: u8, body: &[u8]) -> std::io::Resu
             PACK => {
                 let (path, pass) = split_secret(body)?;
                 let pass = Passphrase::from_bytes(&pass);
-                vaults
+                let identity = vaults
                     .pack_folder(Path::new(&path), pass.as_bytes())
                     .map_err(|error| format!("locking for {path}: {error}"))?;
-                Ok((OK, Vec::new()))
+                Ok((OK, identity.encode().to_vec()))
             }
             UNPACK => {
                 let (path, pass) = split_secret(body)?;
@@ -241,7 +253,18 @@ fn dispatch(vaults: &Vaults, home: &Path, tag: u8, body: &[u8]) -> std::io::Resu
                 let facts = vaults
                     .filename_facts(Path::new(path))
                     .map_err(|error| format!("inspecting for {path}: {error}"))?;
-                Ok((FACTS, vec![u8::from(facts.folder), u8::from(facts.archive)]))
+                let mut reply = vec![
+                    u8::from(facts.folder),
+                    u8::from(facts.archive),
+                    u8::from(facts.occupied),
+                ];
+                if let Some(identity) = facts.identity {
+                    reply.push(1);
+                    reply.extend_from_slice(&identity.encode());
+                } else {
+                    reply.push(0);
+                }
+                Ok((FACTS, reply))
             }
             BOOKMARK => {
                 let path = std::str::from_utf8(body).map_err(|error| {
@@ -309,10 +332,20 @@ fn dispatch(vaults: &Vaults, home: &Path, tag: u8, body: &[u8]) -> std::io::Resu
     }
 }
 
-fn send_flag(sock: &mut UnixStream, set: bool, archive: &Path) -> std::io::Result<()> {
+fn send_flag(
+    sock: &mut UnixStream,
+    pending: &Mutex<Vec<u8>>,
+    set: bool,
+    archive: &Path,
+) -> std::io::Result<()> {
     let fd = open_archive(archive)?;
     write_frame(sock, FLAG, &[u8::from(set)], Some(fd.as_raw_fd()))?;
-    let (tag, body, _) = read_frame(sock)?;
+    let (tag, body, _) = {
+        let mut pending = pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        read_frame(sock, &mut pending)?
+    };
     if tag == ERR {
         return Err(std::io::Error::other(
             String::from_utf8_lossy(&body).into_owned(),
@@ -408,6 +441,9 @@ fn split_secret(body: &[u8]) -> Result<(String, Zeroizing<Vec<u8>>), String> {
 pub struct HomeWorker {
     child: std::process::Child,
     sock: UnixStream,
+    /// Bytes already read past the last frame. Kept on this worker so the next
+    /// worker on the same thread does not treat them as its own reply.
+    pending: Vec<u8>,
     uid: u32,
     vaults: Vaults,
     live: Arc<Mutex<Vec<u32>>>,
@@ -459,6 +495,7 @@ impl HomeWorker {
         let mut worker = Self {
             child,
             sock: ours,
+            pending: Vec::new(),
             uid,
             vaults,
             live,
@@ -498,9 +535,21 @@ impl HomeWorker {
         Ok(PathBuf::from(String::from_utf8_lossy(&body).as_ref()))
     }
 
-    pub fn pack(&mut self, path: &Path, passphrase: &[u8]) -> Result<(), HelperError> {
-        self.secret(PACK, path, passphrase)
-            .map_err(|error| step_error("locking", path, error))
+    pub fn pack(
+        &mut self,
+        path: &Path,
+        passphrase: &[u8],
+    ) -> Result<linux_vault::ArchiveId, HelperError> {
+        let body = self
+            .secret_body(PACK, path, passphrase)
+            .map_err(|error| step_error("locking", path, error))?;
+        linux_vault::ArchiveId::decode(&body).ok_or_else(|| {
+            step_error(
+                "locking",
+                path,
+                HelperError::Failed("worker did not return an archive identity".into()),
+            )
+        })
     }
 
     pub fn unpack(&mut self, path: &Path, passphrase: &[u8]) -> Result<(), HelperError> {
@@ -523,18 +572,28 @@ impl HomeWorker {
         self.send(INSPECT, &path_bytes(path))
             .map_err(|error| step_error("inspecting", path, error))?;
         loop {
-            let (tag, body, fd) = read_frame(&mut self.sock).map_err(|error| {
+            let (tag, body, fd) = self.read_reply().map_err(|error| {
                 step_error("inspecting", path, HelperError::Failed(error.to_string()))
             })?;
             match tag {
-                FLAG => self
-                    .ack_flag(body.first().copied().unwrap_or(0) == 1, fd)
-                    .map_err(|error| step_error("setting the immutable flag", path, error))?,
+                FLAG => {
+                    if let Err(error) = self.ack_flag(body.first().copied().unwrap_or(0) == 1, fd) {
+                        let _ = self.read_reply();
+                        return Err(step_error("setting the immutable flag", path, error));
+                    }
+                }
                 FACTS => {
+                    let identity = if body.get(3).copied() == Some(1) {
+                        linux_vault::ArchiveId::decode(body.get(4..).unwrap_or(&[]))
+                    } else {
+                        None
+                    };
                     return Ok(linux_vault::FilenameFacts {
                         folder: body.first().copied().unwrap_or(0) == 1,
                         archive: body.get(1).copied().unwrap_or(0) == 1,
-                    })
+                        occupied: body.get(2).copied().unwrap_or(0) == 1,
+                        identity,
+                    });
                 }
                 ERR => {
                     return Err(step_error(
@@ -593,20 +652,38 @@ impl HomeWorker {
     }
 
     fn secret(&mut self, tag: u8, path: &Path, passphrase: &[u8]) -> Result<(), HelperError> {
-        let mut body = path_bytes(path);
+        self.secret_body(tag, path, passphrase).map(|_| ())
+    }
+
+    fn secret_body(
+        &mut self,
+        tag: u8,
+        path: &Path,
+        passphrase: &[u8],
+    ) -> Result<Vec<u8>, HelperError> {
+        let mut body = zeroize::Zeroizing::new(path_bytes(path));
         body.push(0);
         body.extend_from_slice(passphrase);
-        self.roundtrip(tag, &body)?;
-        Ok(())
+        let reply = self.roundtrip(tag, &body)?;
+        body.zeroize();
+        Ok(reply)
     }
 
     fn roundtrip(&mut self, tag: u8, body: &[u8]) -> Result<Vec<u8>, HelperError> {
         self.send(tag, body)?;
         loop {
-            let (reply, payload, fd) = read_frame(&mut self.sock)
+            let (reply, payload, fd) = self
+                .read_reply()
                 .map_err(|error| HelperError::Failed(format!("reading worker reply: {error}")))?;
             match reply {
-                FLAG => self.ack_flag(payload.first().copied().unwrap_or(0) == 1, fd)?,
+                FLAG => {
+                    if let Err(error) =
+                        self.ack_flag(payload.first().copied().unwrap_or(0) == 1, fd)
+                    {
+                        let _ = self.read_reply();
+                        return Err(error);
+                    }
+                }
                 OK | FACTS => return Ok(payload),
                 ERR => {
                     return Err(HelperError::Failed(
@@ -620,6 +697,10 @@ impl HomeWorker {
                 }
             }
         }
+    }
+
+    fn read_reply(&mut self) -> std::io::Result<(u8, Vec<u8>, Option<OwnedFd>)> {
+        read_frame(&mut self.sock, &mut self.pending)
     }
 
     fn send(&mut self, tag: u8, body: &[u8]) -> Result<(), HelperError> {
@@ -720,8 +801,8 @@ fn step_error(step: &str, path: &Path, error: HelperError) -> HelperError {
 }
 
 fn worker_program() -> PathBuf {
-    // Tests copy the helper out of a mode 700 home before dropping
-    // CAP_DAC_OVERRIDE. The installed binary is already outside any home.
+    // Tests point at a helper binary. The running service uses /proc/self/exe,
+    // which stays the loaded inode after a package replaces the path.
     if let Some(path) = std::env::var_os("LVE_HELPER_BIN") {
         return PathBuf::from(path);
     }
@@ -729,7 +810,13 @@ fn worker_program() -> PathBuf {
         return PathBuf::from(path);
     }
     let current = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("linux-vault-helper"));
-    // Integration tests run from target/debug/deps. The helper sits next to that.
+    let name = current
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if name.contains("linux-vault-helper") {
+        return PathBuf::from("/proc/self/exe");
+    }
     if let Some(deps) = current.parent() {
         if let Some(debug) = deps.parent() {
             let helper = debug.join("linux-vault-helper");
@@ -747,20 +834,31 @@ fn write_frame(
     body: &[u8],
     fd: Option<RawFd>,
 ) -> std::io::Result<()> {
-    let mut message = Vec::with_capacity(5 + body.len());
+    let mut message = zeroize::Zeroizing::new(Vec::with_capacity(5 + body.len()));
     message.push(tag);
     message.extend_from_slice(&(body.len() as u32).to_le_bytes());
     message.extend_from_slice(body);
-    send_frame(sock.as_raw_fd(), &message, fd)
+    let sent = send_frame(sock.as_raw_fd(), &message, fd);
+    message.zeroize();
+    sent
 }
 
-fn read_frame(sock: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>, Option<OwnedFd>)> {
-    let (mut buf, fd) = recv_some(sock.as_raw_fd())?;
+fn read_frame(
+    sock: &mut UnixStream,
+    pending: &mut Vec<u8>,
+) -> std::io::Result<(u8, Vec<u8>, Option<OwnedFd>)> {
+    let mut buf = std::mem::take(pending);
+    let mut fd = None;
     if buf.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "worker socket closed",
-        ));
+        let (got, got_fd) = recv_some(sock.as_raw_fd())?;
+        fd = got_fd;
+        if got.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "worker socket closed",
+            ));
+        }
+        buf = got;
     }
     while buf.len() < 5 {
         let (more, _) = recv_some(sock.as_raw_fd())?;
@@ -786,13 +884,26 @@ fn read_frame(sock: &mut UnixStream) -> std::io::Result<(u8, Vec<u8>, Option<Own
         }
         buf.extend_from_slice(&more);
     }
-    Ok((buf[0], buf[5..5 + len].to_vec(), fd))
+    let mut body = buf.split_off(5);
+    let rest = if body.len() > len {
+        body.split_off(len)
+    } else {
+        Vec::new()
+    };
+    body.truncate(len);
+    if !rest.is_empty() {
+        *pending = rest;
+    }
+    let tag = buf[0];
+    buf.zeroize();
+    Ok((tag, body, fd))
 }
 
+#[allow(unused_assignments)]
 fn send_frame(sock: RawFd, bytes: &[u8], fd: Option<RawFd>) -> std::io::Result<()> {
     let mut iov = nix::libc::iovec {
-        iov_base: bytes.as_ptr() as *mut nix::libc::c_void,
-        iov_len: bytes.len(),
+        iov_base: std::ptr::null_mut(),
+        iov_len: 0,
     };
     let mut cmsg = [0u8; 64];
     let mut msg: nix::libc::msghdr = unsafe { std::mem::zeroed() };
@@ -810,9 +921,27 @@ fn send_frame(sock: RawFd, bytes: &[u8], fd: Option<RawFd>) -> std::io::Result<(
             std::ptr::write(nix::libc::CMSG_DATA(header) as *mut RawFd, fd);
         }
     }
-    let sent = unsafe { nix::libc::sendmsg(sock, &msg, 0) };
-    if sent < 0 {
-        return Err(std::io::Error::last_os_error());
+    let mut offset = 0;
+    let mut attach_fd = fd;
+    while offset < bytes.len() {
+        iov.iov_base = bytes[offset..].as_ptr() as *mut nix::libc::c_void;
+        iov.iov_len = bytes.len() - offset;
+        if attach_fd.is_none() {
+            msg.msg_control = std::ptr::null_mut();
+            msg.msg_controllen = 0;
+        }
+        let sent = unsafe { nix::libc::sendmsg(sock, &msg, 0) };
+        if sent < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if sent == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "worker socket closed",
+            ));
+        }
+        offset += sent as usize;
+        attach_fd = None;
     }
     Ok(())
 }
@@ -832,6 +961,9 @@ fn recv_some(sock: RawFd) -> std::io::Result<(Vec<u8>, Option<OwnedFd>)> {
     let got = unsafe { nix::libc::recvmsg(sock, &mut msg, 0) };
     if got < 0 {
         return Err(std::io::Error::last_os_error());
+    }
+    if msg.msg_flags & nix::libc::MSG_CTRUNC != 0 {
+        return Err(std::io::Error::other("ancillary data was truncated"));
     }
     buf.truncate(got as usize);
     let mut owned = None;
