@@ -739,7 +739,10 @@ fn apply_user_session(command: &mut Command, launch: Launch) {
     // setgroups, setgid, and setuid, which are async-signal-safe. Same order
     // as the 7z child: groups, then gid, then uid.
     unsafe {
-        command.pre_exec(move || drop_privileges(launch.uid, launch.gid, clear_groups));
+        command.pre_exec(move || {
+            linux_vault::close_extra_fds()?;
+            drop_privileges(launch.uid, launch.gid, clear_groups)
+        });
     }
 }
 

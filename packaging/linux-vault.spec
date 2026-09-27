@@ -28,6 +28,7 @@ the passphrase and locks open vaults on shutdown. lve is the command.
 %build
 # Fedora's %%build flags are for C. Cargo uses its own.
 # CARGO_TARGET_DIR must not point outside this build, or %%install misses the binaries.
+# The rpmbuild _topdir must be on disk (dist/rpmbuild or ~/rpmbuild). /tmp is RAM.
 unset RUSTFLAGS
 unset CARGO_ENCODED_RUSTFLAGS
 unset CARGO_TARGET_DIR

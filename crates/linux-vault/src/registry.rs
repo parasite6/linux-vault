@@ -1,5 +1,6 @@
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,7 @@ const LOCK_NAME: &str = ".lock";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Record {
+    pub uid: u32,
     pub name: String,
     pub path: PathBuf,
     pub state: State,
@@ -46,12 +48,14 @@ impl Drop for LockFile {
 impl LockFile {
     pub fn acquire(dir: &Path) -> Result<Self> {
         let path = dir.join(LOCK_NAME);
-        let file = File::options()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
-            .open(path)?;
+            .mode(0o600)
+            .open(&path)?;
+        restrict(&path);
         file.lock()?;
         Ok(Self { file })
     }
@@ -66,38 +70,47 @@ impl Registry {
                 vaults: Vec::new(),
             });
         }
+        restrict(&path);
         let mut file = File::open(&path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
-        let body: FileBody =
-            serde_json::from_slice(&bytes).map_err(|error| Error::Registry(error.to_string()))?;
-        if body.version != 1 {
-            return Err(Error::Registry(format!(
-                "unsupported registry version {}",
-                body.version
-            )));
-        }
-        Ok(Self {
-            path,
-            vaults: body.vaults,
-        })
+        let body = serde_json::from_slice::<FileBody>(&bytes).ok();
+        // v0.1 has not shipped. An older file is replaced, not migrated.
+        let vaults = match body {
+            Some(body) if body.version == 2 => body.vaults,
+            _ => {
+                eprintln!(
+                    "linux-vault: registry {} is not version 2; starting empty",
+                    path.display()
+                );
+                Vec::new()
+            }
+        };
+        Ok(Self { path, vaults })
     }
 
     pub fn save(&self) -> Result<()> {
         let body = FileBody {
-            version: 1,
+            version: 2,
             vaults: self.vaults.clone(),
         };
         let data =
             serde_json::to_vec_pretty(&body).map_err(|error| Error::Registry(error.to_string()))?;
         let tmp = self.path.with_extension("json.tmp");
         {
-            let mut file = File::create(&tmp)?;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            restrict(&tmp);
             file.write_all(&data)?;
             file.write_all(b"\n")?;
             file.sync_all()?;
         }
         fs::rename(&tmp, &self.path)?;
+        restrict(&self.path);
         if let Some(parent) = self.path.parent() {
             sync_dir(parent)?;
         }
@@ -108,17 +121,17 @@ impl Registry {
         self.vaults.iter()
     }
 
-    pub fn get(&self, name: &str) -> Result<&Record> {
+    pub fn get(&self, uid: u32, name: &str) -> Result<&Record> {
         self.vaults
             .iter()
-            .find(|record| record.name == name)
+            .find(|record| record.uid == uid && record.name == name)
             .ok_or(Error::NotFound)
     }
 
-    pub fn get_mut(&mut self, name: &str) -> Result<&mut Record> {
+    pub fn get_mut(&mut self, uid: u32, name: &str) -> Result<&mut Record> {
         self.vaults
             .iter_mut()
-            .find(|record| record.name == name)
+            .find(|record| record.uid == uid && record.name == name)
             .ok_or(Error::NotFound)
     }
 
@@ -126,7 +139,7 @@ impl Registry {
         if self
             .vaults
             .iter()
-            .any(|existing| existing.name == record.name)
+            .any(|existing| existing.uid == record.uid && existing.name == record.name)
         {
             return Err(Error::AlreadyExists);
         }
@@ -142,12 +155,16 @@ impl Registry {
         Ok(())
     }
 
-    pub fn remove(&mut self, name: &str) -> Result<Record> {
+    pub fn remove(&mut self, uid: u32, name: &str) -> Result<Record> {
         let index = self
             .vaults
             .iter()
-            .position(|record| record.name == name)
+            .position(|record| record.uid == uid && record.name == name)
             .ok_or(Error::NotFound)?;
         Ok(self.vaults.remove(index))
     }
+}
+
+fn restrict(path: &Path) {
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
 }

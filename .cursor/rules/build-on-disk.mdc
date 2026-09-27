@@ -1,0 +1,12 @@
+---
+description: Keep Cargo and RPM build output on disk, never on /tmp
+alwaysApply: true
+---
+
+# Build output stays on disk
+
+`/tmp` is RAM on Fedora. Do not put compiler output or RPM build trees there.
+
+- Before any `cargo` command, set `CARGO_TARGET_DIR` to the workspace `target/` directory. That overrides a sandbox cache under `/tmp/cursor-sandbox-cache`. `.cargo/config.toml` already names `target/`; the environment variable wins over that file, so set the variable explicitly.
+- Run `rpmbuild` with `_topdir` at `dist/rpmbuild` or `~/rpmbuild`. Do not use `/tmp/linux-vault-rpmbuild-*`.
+- The spec unsets `CARGO_TARGET_DIR` inside `%build` so the package build stays inside that `_topdir`. Leave that unset in place.

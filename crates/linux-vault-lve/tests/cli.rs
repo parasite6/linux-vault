@@ -9,8 +9,8 @@ use linux_vault::Vaults;
 use linux_vault_dbus::OBJECT_PATH;
 use linux_vault_helper::{Account, Authorizer, Helper, Prompt};
 use linux_vault_lve::{
-    parse, run, write_usage, Invocation, CANCELLED, NEEDS_RECOVERY, NOT_AUTHORIZED, OK, OPEN_FILE,
-    USAGE, WRONG_PASSPHRASE,
+    parse, run, write_usage, Invocation, CANCELLED, NEEDS_RECOVERY, NOT_AUTHORIZED, NOT_FOUND, OK,
+    OPEN_FILE, USAGE, WRONG_PASSPHRASE,
 };
 use tokio::net::UnixStream;
 use zbus::connection::Builder;
@@ -240,6 +240,14 @@ async fn an_open_file_a_wrong_passphrase_and_a_denial_have_their_own_codes() {
     let denied = session("secret", Authorizer::Deny).await;
     let (code, _out, err) = invoke(&denied, &["ls"]).await;
     assert_eq!(code, NOT_AUTHORIZED, "{err}");
+}
+
+#[tokio::test]
+async fn a_missing_vault_is_not_found() {
+    let session = session("secret", Authorizer::Allow).await;
+    let (code, _out, err) = invoke(&session, &["lock", "NoSuch"]).await;
+    assert_eq!(code, NOT_FOUND, "{err}");
+    assert!(err.contains("vault not found"), "{err}");
 }
 
 #[tokio::test]

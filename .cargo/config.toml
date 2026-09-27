@@ -1,0 +1,7 @@
+# Compiler output stays on disk. /tmp is RAM on Fedora, and a sandbox
+# cache there grew large enough that other programs could not start.
+#
+# CARGO_TARGET_DIR overrides this. If a sandbox sets that variable to a
+# path under /tmp, point it back at this directory before running cargo.
+[build]
+target-dir = "target"

@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
@@ -70,6 +70,20 @@ pub fn run_without_passphrase(
     finish(spawn(seven_zip, args, cwd, user)?, None, None)
 }
 
+pub fn close_extra_fds() -> std::io::Result<()> {
+    // CLOSE_RANGE_CLOEXEC, not an immediate close. Rust reports a failed
+    // pre_exec on a pipe above stderr. Closing that pipe makes the failure
+    // look like success and the child still execs. The flag drops every
+    // descriptor above stderr when exec runs.
+    const CLOSE_RANGE_CLOEXEC: u32 = 4;
+    let rc = unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, CLOSE_RANGE_CLOEXEC) };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Uid and gid for the `7z` child. `setuid`/`setgid` replace the real,
 /// effective, and saved ids, so the child cannot switch back to root.
 #[derive(Clone, Copy)]
@@ -91,17 +105,19 @@ fn spawn(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if let Some(user) = user {
-        // `CommandExt::groups` is still unstable. `pre_exec` runs in the child
-        // before exec. `setgroups` has to happen before `setuid`, so the uid
-        // and gid switch are in the same hook: a later `Command::uid` would
-        // drop privileges first and `setgroups` would then fail.
-        let clear_groups = must_clear_groups();
-        // SAFETY: the closure runs between fork and exec. It only calls
-        // setgroups, setgid, and setuid, which are async-signal-safe.
-        unsafe {
-            command.pre_exec(move || drop_privileges(user, clear_groups));
-        }
+    let clear_groups = must_clear_groups();
+    // SAFETY: the closure runs between fork and exec. It only calls
+    // close_range, setgroups, setgid, and setuid, which are async-signal-safe.
+    // close_range drops every descriptor above stderr, including the worker
+    // socket, before 7z runs.
+    unsafe {
+        command.pre_exec(move || {
+            close_extra_fds()?;
+            if let Some(user) = user {
+                drop_privileges(user, clear_groups)?;
+            }
+            Ok(())
+        });
     }
     command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
@@ -179,7 +195,10 @@ fn finish(
 
     let output = match stop {
         Some(stop) => wait_or_stop(&mut child, stop)?,
-        None => child.wait_with_output()?,
+        None => {
+            let stop = AtomicBool::new(false);
+            wait_or_stop(&mut child, &stop)?
+        }
     };
     if output.status.success() {
         if let Some(error) = write_error {
@@ -205,20 +224,14 @@ fn finish(
 /// Stdout and stderr are read on other threads so a full pipe cannot stall
 /// `7z` while this thread is polling.
 fn wait_or_stop(child: &mut std::process::Child, stop: &AtomicBool) -> Result<Output> {
-    let stdout = child.stdout.take().map(|mut pipe| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stderr = child.stderr.take().map(|mut pipe| {
-        thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    });
+    let stdout = child
+        .stdout
+        .take()
+        .map(|pipe| thread::spawn(move || read_capped(pipe)));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| thread::spawn(move || read_capped(pipe)));
     let status = loop {
         if stop.load(Ordering::SeqCst) {
             let _ = child.kill();
@@ -237,6 +250,26 @@ fn wait_or_stop(child: &mut std::process::Child, stop: &AtomicBool) -> Result<Ou
             .map(|reader| reader.join().unwrap_or_default())
             .unwrap_or_default(),
     })
+}
+
+/// Keep at most 64 KiB. The rest is discarded so a noisy `7z` cannot grow
+/// without limit. The pipe is still drained, or the child blocks on a full buffer.
+fn read_capped(mut pipe: impl std::io::Read) -> Vec<u8> {
+    const CAP: usize = 64 * 1024;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match pipe.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < CAP {
+                    let keep = n.min(CAP - buf.len());
+                    buf.extend_from_slice(&chunk[..keep]);
+                }
+            }
+        }
+    }
+    buf
 }
 
 fn is_wrong_passphrase(message: &str) -> bool {
@@ -362,6 +395,41 @@ mod tests {
             !report.exists(),
             "7z ran after setgroups, setgid, or setuid failed"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_child_does_not_inherit_descriptors_past_stderr() {
+        let dir = std::env::temp_dir().join(format!("linux-vault-fds-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("7z");
+        let program = r#"#!/usr/bin/env python3
+import os, sys
+for number in range(3, 64):
+    try:
+        os.stat(f"/proc/self/fd/{number}")
+    except FileNotFoundError:
+        continue
+    else:
+        sys.exit(f"fd {number} survived")
+"#;
+        let mut file = std::fs::File::create(&script).unwrap();
+        file.write_all(program.as_bytes()).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let path = std::ffi::CString::new("/dev/null").unwrap();
+        let extra = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        assert!(extra >= 3, "could not open an inherited descriptor");
+        let mut child = spawn(&script, &[], &dir, None).unwrap();
+        let status = child.wait().unwrap();
+        unsafe {
+            libc::close(extra);
+        }
+        assert!(status.success(), "inherited descriptors: {status}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

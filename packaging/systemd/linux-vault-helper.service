@@ -25,6 +25,7 @@ CapabilityBoundingSet=CAP_LINUX_IMMUTABLE CAP_FOWNER CAP_SETUID CAP_SETGID CAP_I
 ProtectSystem=strict
 PrivateTmp=yes
 StateDirectory=linux-vault
+StateDirectoryMode=0700
 ReadWritePaths=/var/lib/linux-vault /home
 # Passphrase pages stay resident. CAP_IPC_LOCK is already in the bounding set.
 LimitMEMLOCK=infinity

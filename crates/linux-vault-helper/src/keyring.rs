@@ -38,15 +38,15 @@ impl ProcessKeys {
         })
     }
 
-    pub fn contains(&self, name: &str) -> bool {
-        self.lookup(name).is_ok()
+    pub fn contains(&self, uid: u32, name: &str) -> bool {
+        self.lookup(uid, name).is_ok()
     }
 
     /// Copy the passphrase into the process keyring, then drop the userspace bytes.
-    pub fn insert(&self, name: &str, passphrase: Passphrase) -> Result<(), HelperError> {
+    pub fn insert(&self, uid: u32, name: &str, passphrase: Passphrase) -> Result<(), HelperError> {
         let ring = process_ring()?;
         let key = ring
-            .add_key(&self.description(name), passphrase.as_bytes())
+            .add_key(&self.description(uid, name), passphrase.as_bytes())
             .map_err(|error| named("storing passphrase", name, &error))?;
         let perms = KeyPermissionsBuilder::builder()
             .posessor(Permission::ALL)
@@ -61,8 +61,8 @@ impl ProcessKeys {
     /// Read the passphrase back. The kernel copy stays until [`Self::forget`].
     ///
     /// Lock is the caller. Nothing on the bus reads this.
-    pub fn read(&self, name: &str) -> Result<Passphrase, HelperError> {
-        let key = self.lookup(name)?;
+    pub fn read(&self, uid: u32, name: &str) -> Result<Passphrase, HelperError> {
+        let key = self.lookup(uid, name)?;
         let mut buffer = [0u8; PAYLOAD_CAP];
         let len = key
             .read(&mut buffer)
@@ -81,8 +81,8 @@ impl ProcessKeys {
     /// Remove the key and let the kernel discard its payload.
     ///
     /// A key that is already gone or revoked is a success: its payload is wiped.
-    pub fn forget(&self, name: &str) -> Result<(), HelperError> {
-        let key = match self.lookup(name) {
+    pub fn forget(&self, uid: u32, name: &str) -> Result<(), HelperError> {
+        let key = match self.lookup(uid, name) {
             Ok(key) => key,
             Err(HelperError::Failed(message)) if already_gone(&message) => return Ok(()),
             Err(error) => return Err(error),
@@ -94,19 +94,19 @@ impl ProcessKeys {
         }
     }
 
-    fn lookup(&self, name: &str) -> Result<linux_keyutils::Key, HelperError> {
+    fn lookup(&self, uid: u32, name: &str) -> Result<linux_keyutils::Key, HelperError> {
         process_ring()?
-            .search(&self.description(name))
+            .search(&self.description(uid, name))
             .map_err(|error| named("finding passphrase", name, &error))
     }
 
-    fn description(&self, name: &str) -> String {
-        format!("{}{name}", self.prefix)
+    fn description(&self, uid: u32, name: &str) -> String {
+        format!("{}{uid}-{name}", self.prefix)
     }
 
     #[cfg(test)]
-    fn absent_from_other_keyrings(&self, name: &str) -> bool {
-        let description = self.description(name);
+    fn absent_from_other_keyrings(&self, uid: u32, name: &str) -> bool {
+        let description = self.description(uid, name);
         [
             KeyRingIdentifier::Thread,
             KeyRingIdentifier::Session,
@@ -142,29 +142,29 @@ mod tests {
     #[test]
     fn a_passphrase_stays_on_the_process_keyring_and_is_wiped_at_lock() {
         let keys = ProcessKeys::new().unwrap();
-        keys.insert("Forge", Passphrase::from_bytes(b"secret"))
+        keys.insert(0, "Forge", Passphrase::from_bytes(b"secret"))
             .unwrap();
-        assert!(keys.contains("Forge"));
-        assert!(keys.absent_from_other_keyrings("Forge"));
+        assert!(keys.contains(0, "Forge"));
+        assert!(keys.absent_from_other_keyrings(0, "Forge"));
 
-        let key = keys.lookup("Forge").unwrap();
+        let key = keys.lookup(0, "Forge").unwrap();
         let bits = key.metadata().unwrap().get_perms().bits();
         assert_eq!(bits >> 24, u32::from(Permission::ALL.bits()));
         assert_eq!(bits & 0x00ff_ffff, 0);
 
         let keys_for_thread = keys.clone();
         std::thread::spawn(move || {
-            let read = keys_for_thread.read("Forge").unwrap();
+            let read = keys_for_thread.read(0, "Forge").unwrap();
             assert_eq!(read.as_bytes(), b"secret");
         })
         .join()
         .unwrap();
 
-        assert_eq!(keys.read("Forge").unwrap().as_bytes(), b"secret");
-        keys.forget("Forge").unwrap();
-        assert!(!keys.contains("Forge"));
-        assert!(keys.read("Forge").is_err());
-        keys.forget("Forge").unwrap();
+        assert_eq!(keys.read(0, "Forge").unwrap().as_bytes(), b"secret");
+        keys.forget(0, "Forge").unwrap();
+        assert!(!keys.contains(0, "Forge"));
+        assert!(keys.read(0, "Forge").is_err());
+        keys.forget(0, "Forge").unwrap();
     }
 
     #[test]
@@ -185,11 +185,11 @@ mod tests {
         }
         crate::limit_to_unit_capabilities();
         let keys = ProcessKeys::new().unwrap();
-        keys.insert("lve-trial", Passphrase::from_bytes(b"secret"))
+        keys.insert(0, "lve-trial", Passphrase::from_bytes(b"secret"))
             .unwrap();
-        assert_eq!(keys.read("lve-trial").unwrap().as_bytes(), b"secret");
-        keys.forget("lve-trial").unwrap();
-        let missing = keys.read("lve-trial").unwrap_err().to_string();
+        assert_eq!(keys.read(0, "lve-trial").unwrap().as_bytes(), b"secret");
+        keys.forget(0, "lve-trial").unwrap();
+        let missing = keys.read(0, "lve-trial").unwrap_err().to_string();
         assert!(missing.contains("passphrase for lve-trial"), "{missing}");
     }
 }

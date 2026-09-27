@@ -21,6 +21,7 @@ pub const NOT_AUTHORIZED: u8 = 7;
 pub const NOT_LOGGED_IN: u8 = 8;
 pub const NO_SPACE: u8 = 9;
 pub const CANCELLED: u8 = 10;
+pub const NOT_FOUND: u8 = 11;
 
 const HELP: &str = "\
 lve — lock a folder in your home
@@ -50,6 +51,7 @@ Exit codes:
   8   not logged in
   9   not enough free space
   10  prompt cancelled
+  11  vault not found
 ";
 
 #[derive(Debug)]
@@ -345,6 +347,9 @@ fn exit_code_for(name: &str, message: &str) -> u8 {
     if name.ends_with("Cancelled") {
         return CANCELLED;
     }
+    if name.ends_with("NotFound") {
+        return NOT_FOUND;
+    }
     let lower = message.to_ascii_lowercase();
     if lower.contains("wrong passphrase") {
         return WRONG_PASSPHRASE;
@@ -388,6 +393,10 @@ mod exit_tests {
         assert_eq!(
             exit_code_for("org.linuxvault.Error.Cancelled", "cancelled"),
             CANCELLED
+        );
+        assert_eq!(
+            exit_code_for("org.linuxvault.Error.NotFound", "vault not found"),
+            NOT_FOUND
         );
         assert_eq!(
             exit_code_for("org.linuxvault.Error.Failed", "wrong passphrase: no"),

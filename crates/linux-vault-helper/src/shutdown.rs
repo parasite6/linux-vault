@@ -13,7 +13,7 @@
 
 use std::os::unix::fs::MetadataExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -163,9 +163,11 @@ pub struct ShutdownHandle {
     run: Arc<Mutex<()>>,
     /// How many vaults this process has started locking from shutdown.
     lock_attempts: Arc<AtomicUsize>,
+    workers: Arc<StdMutex<Vec<u32>>>,
 }
 
 impl ShutdownHandle {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         gate: Arc<Gate>,
         cancel: CancelToken,
@@ -174,6 +176,7 @@ impl ShutdownHandle {
         inhibit: Arc<Inhibit>,
         run: Arc<Mutex<()>>,
         lock_attempts: Arc<AtomicUsize>,
+        workers: Arc<StdMutex<Vec<u32>>>,
     ) -> Self {
         Self {
             gate,
@@ -183,6 +186,7 @@ impl ShutdownHandle {
             inhibit,
             run,
             lock_attempts,
+            workers,
         }
     }
 
@@ -232,7 +236,8 @@ impl ShutdownHandle {
             // and the process keyring, because the system bus may be stopping.
             self.notify_locking().await;
             self.cancel.cancel();
-            self.vaults.request_stop_extract();
+            crate::worker::abort_live_workers(&self.workers);
+            crate::worker::wait_for_workers(&self.workers, std::time::Duration::from_secs(30));
             self.gate.wait_idle().await;
         }
         self.lock_what_is_open().await;
@@ -323,14 +328,14 @@ impl ShutdownHandle {
             if vault.state != State::Unlocked {
                 continue;
             }
-            match self.passphrases.read(&vault.name) {
+            match self.passphrases.read(vault.uid, &vault.name) {
                 Ok(passphrase) => self.lock_held(vault, passphrase).await,
                 Err(HelperError::Failed(message)) if key_is_missing(&message) => {
-                    self.mark_recovery(&vault.name).await;
+                    self.mark_recovery(vault.uid, &vault.name).await;
                 }
                 Err(error) => {
                     eprintln!("linux-vault-helper: {error}");
-                    self.mark_recovery(&vault.name).await;
+                    self.mark_recovery(vault.uid, &vault.name).await;
                 }
             }
         }
@@ -342,19 +347,35 @@ impl ShutdownHandle {
         let path = vault.path.clone();
         let Some((uid, gid, home)) = crate::ids_for_path(&path) else {
             eprintln!("linux-vault-helper: cannot see the owner of {name}; it needs recovery");
-            self.mark_recovery(&name).await;
+            self.mark_recovery(vault.uid, &name).await;
             return;
         };
         let vaults = self.vaults.share();
+        let passphrases = self.passphrases.clone();
+        let live = Arc::clone(&self.workers);
         let locked = tokio::task::spawn_blocking(move || {
-            let (stored, previous) = vaults
-                .begin_lock(&name)
+            let (stored, _previous) = vaults
+                .begin_lock(uid, &name)
                 .map_err(|error| HelperError::Failed(format!("locking for {name}: {error}")))?;
-            let mut worker = match crate::worker::HomeWorker::spawn(uid, gid, &home, vaults.share())
-            {
+            let mut worker = match crate::worker::HomeWorker::spawn(
+                uid,
+                gid,
+                &home,
+                vaults.share(),
+                live.clone(),
+            ) {
                 Ok(worker) => worker,
                 Err(error) => {
-                    let _ = vaults.finish_lock(&name, previous, false);
+                    reconcile_or_log(
+                        &vaults,
+                        &passphrases,
+                        uid,
+                        gid,
+                        &home,
+                        &stored,
+                        &name,
+                        &live,
+                    );
                     return Err(error);
                 }
             };
@@ -367,15 +388,45 @@ impl ShutdownHandle {
                 }
             }
             let packed = worker.pack(&stored, passphrase.as_bytes());
+            if packed.is_err() {
+                reconcile_or_log(
+                    &vaults,
+                    &passphrases,
+                    uid,
+                    gid,
+                    &home,
+                    &stored,
+                    &name,
+                    &live,
+                );
+                if let Err(ref error) = packed {
+                    if error.to_string().contains("immutable") {
+                        eprintln!("linux-vault-helper: locking for {name}: {error}");
+                    }
+                }
+                return packed;
+            }
             vaults
-                .finish_lock(&name, previous, packed.is_ok())
-                .map_err(|error| HelperError::Failed(format!("locking for {name}: {error}")))?;
+                .set_state(uid, &name, State::Locked)
+                .map_err(|error| {
+                    reconcile_or_log(
+                        &vaults,
+                        &passphrases,
+                        uid,
+                        gid,
+                        &home,
+                        &stored,
+                        &name,
+                        &live,
+                    );
+                    HelperError::Failed(format!("locking for {name}: {error}"))
+                })?;
             packed
         })
         .await;
         match locked {
             Ok(Ok(())) => {
-                if let Err(error) = self.passphrases.forget(&vault.name) {
+                if let Err(error) = self.passphrases.forget(vault.uid, &vault.name) {
                     eprintln!("linux-vault-helper: {error}");
                 }
             }
@@ -388,10 +439,11 @@ impl ShutdownHandle {
         }
     }
 
-    async fn mark_recovery(&self, name: &str) {
+    async fn mark_recovery(&self, uid: u32, name: &str) {
         let vaults = Arc::clone(&self.vaults);
         let name = name.to_string();
-        let marked = tokio::task::spawn_blocking(move || vaults.mark_needs_recovery(&name)).await;
+        let marked =
+            tokio::task::spawn_blocking(move || vaults.mark_needs_recovery(uid, &name)).await;
         match marked {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -406,6 +458,24 @@ impl ShutdownHandle {
 
 fn key_is_missing(message: &str) -> bool {
     message.contains("KeyDoesNotExist") || message.contains("KeyRevoked")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_or_log(
+    vaults: &linux_vault::Vaults,
+    keys: &crate::HeldPassphrases,
+    uid: u32,
+    gid: u32,
+    home: &std::path::Path,
+    path: &std::path::Path,
+    name: &str,
+    workers: &std::sync::Arc<std::sync::Mutex<Vec<u32>>>,
+) {
+    if let Err(error) =
+        crate::reconcile_from_disk(vaults, keys, uid, gid, home, path, name, workers)
+    {
+        eprintln!("linux-vault-helper: reconciling {name} for uid {uid}: {error}");
+    }
 }
 
 fn plain_user(user: &str) -> bool {

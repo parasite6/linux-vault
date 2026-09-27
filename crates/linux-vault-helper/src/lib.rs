@@ -23,7 +23,7 @@ use std::ffi::{CStr, OsString};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use linux_vault::State;
 use linux_vault_dbus::VaultStatus;
@@ -43,6 +43,8 @@ pub use caller::{caller_from_connection, Caller};
 ///
 /// Tests call this so a check does not run with the rest of root's set.
 /// `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` are among the ones removed.
+/// The call applies to this thread. A process-wide limit has to happen before
+/// other threads are created.
 #[doc(hidden)]
 pub fn limit_to_unit_capabilities() {
     const KEEP: &[i32] = &[3, 6, 7, 9, 14, 19];
@@ -50,6 +52,8 @@ pub fn limit_to_unit_capabilities() {
     const SYS_CAPGET: i64 = 125;
     const SYS_CAPSET: i64 = 126;
     const PR_CAPBSET_DROP: i32 = 24;
+    const PR_CAP_AMBIENT: i32 = 47;
+    const PR_CAP_AMBIENT_CLEAR_ALL: usize = 4;
     #[repr(C)]
     struct Header {
         version: u32,
@@ -62,6 +66,15 @@ pub fn limit_to_unit_capabilities() {
         inheritable: u32,
     }
     unsafe {
+        // An ambient bit outside the new inheritable set makes capset fail
+        // and leave the old effective set in place.
+        nix::libc::prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+        // Bounding-set drops need CAP_SETPCAP, which the final set does not keep.
+        for cap in 0..64 {
+            if !KEEP.contains(&cap) {
+                nix::libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
+            }
+        }
         let mut header = Header {
             version: VERSION_3,
             pid: 0,
@@ -77,11 +90,6 @@ pub fn limit_to_unit_capabilities() {
             data[0].inheritable &= low;
             data[1] = std::mem::zeroed();
             nix::libc::syscall(SYS_CAPSET, &header, data.as_ptr());
-        }
-        for cap in 0..64 {
-            if !KEEP.contains(&cap) {
-                nix::libc::prctl(PR_CAPBSET_DROP, cap, 0, 0, 0);
-            }
         }
     }
 }
@@ -123,7 +131,7 @@ pub struct Account {
     pub home: PathBuf,
 }
 
-enum Accounts {
+pub enum Accounts {
     /// Look the caller up in the password database.
     Passwd,
     /// Tests supply the home directory. The bus caller is still authorized.
@@ -144,6 +152,7 @@ pub struct Helper {
     /// Cancelling this stops every open pinentry.
     cancel: CancelToken,
     shutdown: ShutdownHandle,
+    workers: Arc<Mutex<Vec<u32>>>,
 }
 
 impl Helper {
@@ -165,6 +174,16 @@ impl Helper {
         Self::from_parts(authorizer, vaults, prompt, Accounts::Fixed(account))
     }
 
+    /// Same as [`Self::system`], but the registry and pinentry are supplied.
+    /// The caller's account comes from the password database.
+    pub fn for_passwd(
+        authorizer: Authorizer,
+        vaults: linux_vault::Vaults,
+        prompt: Prompt,
+    ) -> Result<Self, HelperError> {
+        Self::from_parts(authorizer, vaults, prompt, Accounts::Passwd)
+    }
+
     fn from_parts(
         authorizer: Authorizer,
         vaults: linux_vault::Vaults,
@@ -176,6 +195,7 @@ impl Helper {
         let cancel = CancelToken::new();
         let inhibit = ShutdownHandle::inhibit();
         let passphrases = HeldPassphrases::new()?;
+        let workers = Arc::new(Mutex::new(Vec::new()));
         let shutdown = ShutdownHandle::new(
             Arc::clone(&gate),
             cancel.clone(),
@@ -184,6 +204,7 @@ impl Helper {
             Arc::clone(&inhibit),
             Arc::new(tokio::sync::Mutex::new(())),
             Arc::new(AtomicUsize::new(0)),
+            Arc::clone(&workers),
         );
         let helper = Self {
             authorizer,
@@ -195,6 +216,7 @@ impl Helper {
             gate,
             cancel,
             shutdown,
+            workers,
         };
         helper.reconcile_with_workers()?;
         Ok(helper)
@@ -225,12 +247,13 @@ impl Helper {
                 account.gid,
                 &account.home,
                 self.vaults.share(),
+                Arc::clone(&self.workers),
             )?;
             for vault in vaults {
                 let facts = worker.inspect(&vault.path)?;
                 if !facts.folder && !facts.archive {
                     self.vaults
-                        .unregister(&vault.name)
+                        .unregister(vault.uid, &vault.name)
                         .map_err(|error| failed("reconciling", &vault.name, error))?;
                     worker.remove_bookmark(&vault.path)?;
                     continue;
@@ -241,7 +264,7 @@ impl Helper {
                     linux_vault::State::NeedsRecovery
                 };
                 self.vaults
-                    .set_state(&vault.name, state)
+                    .set_state(vault.uid, &vault.name, state)
                     .map_err(|error| failed("reconciling", &vault.name, error))?;
                 if facts.archive {
                     worker.seal(&vault.path)?;
@@ -315,8 +338,8 @@ impl Helper {
         Ok(self.vaults.share())
     }
 
-    fn keep(&self, name: &str, passphrase: Passphrase) -> Result<(), HelperError> {
-        self.passphrases.insert(name, passphrase)
+    fn keep(&self, uid: u32, name: &str, passphrase: Passphrase) -> Result<(), HelperError> {
+        self.passphrases.insert(uid, name, passphrase)
     }
 
     async fn owned_vault(
@@ -325,20 +348,24 @@ impl Helper {
         name: &str,
     ) -> Result<linux_vault::Vault, HelperError> {
         let vaults = self.vaults_for(account)?;
+        let uid = account.uid;
         let name_owned = name.to_string();
         let vault_name = name.to_string();
-        let vault = tokio::task::spawn_blocking(move || vaults.get(&name_owned))
+        let vault = tokio::task::spawn_blocking(move || vaults.get_for(uid, &name_owned))
             .await
             .map_err(|error| failed("reading the registry", &vault_name, error))?
-            .map_err(|error| failed("reading the registry", name, error))?;
+            .map_err(|error| match error {
+                linux_vault::Error::NotFound => vault_not_found(),
+                other => failed("reading the registry", name, other),
+            })?;
         if !caller_owns(&account.home, account.uid, &vault.path) {
-            return Err(failed("reading the registry", name, "vault not found"));
+            return Err(vault_not_found());
         }
         Ok(vault)
     }
 
-    /// The worker scans the owner's processes. The helper scans root's when
-    /// the owner is someone else.
+    /// The worker scans the owner's processes. The helper always scans root's,
+    /// because the worker has no `CAP_SYS_PTRACE`.
     async fn files_are_open(
         &self,
         uid: u32,
@@ -351,35 +378,22 @@ impl Helper {
         let home = home.to_path_buf();
         let owner_path = path.to_path_buf();
         let owner_name = name.to_string();
+        let live = Arc::clone(&self.workers);
         tokio::task::spawn_blocking(move || {
-            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults)?;
+            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, live.clone())?;
             worker.scan_open_files(&owner_name, &owner_path)
         })
         .await
         .map_err(|error| failed("checking open files", name, error))??;
-        if uid != 0 {
-            let root_path = path.to_path_buf();
-            let root_name = name.to_string();
-            tokio::task::spawn_blocking(move || {
-                open_files::refuse_if_open(&root_path, &root_name, 0)
-            })
+        // The worker has no capabilities, so it cannot read a non-dumpable
+        // root process. The helper still has CAP_SYS_PTRACE and always scans
+        // root, including when the vault owner is root.
+        let root_path = path.to_path_buf();
+        let root_name = name.to_string();
+        tokio::task::spawn_blocking(move || open_files::refuse_if_open(&root_path, &root_name, 0))
             .await
             .map_err(|error| failed("checking open files", name, error))??;
-        }
         Ok(())
-    }
-
-    /// A lock that stops before 7z starts. A held passphrase goes back to
-    /// unlocked. No held passphrase is needs recovery.
-    fn restore_before_pack(&self, name: &str) {
-        let state = if self.passphrases.contains(name) {
-            State::Unlocked
-        } else {
-            State::NeedsRecovery
-        };
-        if let Err(error) = self.vaults.set_state(name, state) {
-            eprintln!("linux-vault-helper: locking for {name}: {error}");
-        }
     }
 }
 
@@ -400,22 +414,22 @@ impl HeldPassphrases {
         })
     }
 
-    pub fn contains(&self, name: &str) -> bool {
-        self.keys.contains(name)
+    pub fn contains(&self, uid: u32, name: &str) -> bool {
+        self.keys.contains(uid, name)
     }
 
-    fn insert(&self, name: &str, passphrase: Passphrase) -> Result<(), HelperError> {
-        self.keys.insert(name, passphrase)
+    fn insert(&self, uid: u32, name: &str, passphrase: Passphrase) -> Result<(), HelperError> {
+        self.keys.insert(uid, name, passphrase)
     }
 
     /// The passphrase Lock feeds to `7z`. Nothing on the bus reads this.
-    pub(crate) fn read(&self, name: &str) -> Result<Passphrase, HelperError> {
-        self.keys.read(name)
+    pub(crate) fn read(&self, uid: u32, name: &str) -> Result<Passphrase, HelperError> {
+        self.keys.read(uid, name)
     }
 
     /// Drop the key after a successful lock.
-    pub fn forget(&self, name: &str) -> Result<(), HelperError> {
-        self.keys.forget(name)
+    pub fn forget(&self, uid: u32, name: &str) -> Result<(), HelperError> {
+        self.keys.forget(uid, name)
     }
 }
 
@@ -431,7 +445,7 @@ impl Helper {
         let caller = self.gate(connection, &header).await?;
         let account = self.account_of(&caller)?;
         let name = folder_name(path)?;
-        let _guard = self.locks.acquire(&name).await;
+        let _guard = self.locks.acquire(account.uid, &name).await;
         self.gate.ensure_open()?;
         let pinentry = self.pinentry_for(&account)?;
         let prompt = self.cancel.child();
@@ -445,19 +459,21 @@ impl Helper {
         let gid = account.gid;
         let path = path.to_string();
         let reported = path.clone();
+        let live = Arc::clone(&self.workers);
         let created = tokio::task::spawn_blocking(move || {
-            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults.share())?;
+            let mut worker =
+                worker::HomeWorker::spawn(uid, gid, &home, vaults.share(), live.clone())?;
             let canonical = worker.resolve(Path::new(&path))?;
             if canonical != home && !canonical.starts_with(&home) {
                 return Err(failed("creating", &path, "vault path is outside the home"));
             }
             vaults
-                .register_unlocked(&canonical)
+                .register_unlocked(uid, &canonical)
                 .map_err(|error| failed("creating", &canonical.display().to_string(), error))
         })
         .await
         .map_err(|error| failed("creating", &reported, error))??;
-        self.keep(&created.name, passphrase)?;
+        self.keep(account.uid, &created.name, passphrase)?;
         self.shutdown_handle().arm_inhibitor().await;
         Ok(())
     }
@@ -478,15 +494,10 @@ impl Helper {
                 "vault name is not a single path component",
             ));
         }
-        let _guard = self.locks.acquire(name).await;
+        self.owned_vault(&account, name).await?;
+        let _vault_lock = self.locks.acquire(account.uid, name).await;
         self.gate.ensure_open()?;
-        let vaults = self.vaults_for(&account)?;
-        let name_owned = name.to_string();
-        let vault_name = name.to_string();
-        let vault = tokio::task::spawn_blocking(move || vaults.get(&name_owned))
-            .await
-            .map_err(|error| failed("locking", &vault_name, error))?
-            .map_err(|error| failed("locking", name, error))?;
+        let vault = self.owned_vault(&account, name).await?;
         match vault.state {
             State::Unlocked | State::NeedsRecovery => {}
             state => {
@@ -494,78 +505,58 @@ impl Helper {
             }
         }
         let path = vault.path.clone();
-        let vault_name = name.to_string();
-        let (_stored_path, previous) = self
+        let (_stored_path, _previous) = self
             .vaults
-            .begin_lock(name)
+            .begin_lock(account.uid, name)
             .map_err(|error| failed("locking", name, error))?;
-        if let Err(error) = self
-            .files_are_open(account.uid, account.gid, &account.home, &path, name)
-            .await
-        {
-            self.restore_before_pack(name);
-            return Err(error);
-        }
-        let passphrase = match self.passphrases.read(name) {
+        let mut rollback = DiskReconcile {
+            armed: true,
+            uid: account.uid,
+            gid: account.gid,
+            home: account.home.clone(),
+            path: path.clone(),
+            name: name.to_string(),
+            vaults: self.vaults.share(),
+            keys: self.passphrases.clone(),
+            workers: Arc::clone(&self.workers),
+        };
+        self.files_are_open(account.uid, account.gid, &account.home, &path, name)
+            .await?;
+        let passphrase = match self.passphrases.read(account.uid, name) {
             Ok(passphrase) => passphrase,
             Err(HelperError::Failed(message)) if passphrase_is_missing(&message) => {
-                let pinentry = match self.pinentry_for(&account) {
-                    Ok(pinentry) => pinentry,
-                    Err(error) => {
-                        self.restore_before_pack(name);
-                        return Err(error);
-                    }
-                };
+                let pinentry = self.pinentry_for(&account)?;
                 let prompt = self.cancel.child();
-                match pinentry.ask(Purpose::Recovery, name, &prompt).await {
-                    Ok(passphrase) => passphrase,
-                    Err(error) => {
-                        self.restore_before_pack(name);
-                        return Err(named_pin("asking for the passphrase", name, error));
-                    }
-                }
+                pinentry
+                    .ask(Purpose::Recovery, name, &prompt)
+                    .await
+                    .map_err(|error| named_pin("asking for the passphrase", name, error))?
             }
-            Err(error) => {
-                self.restore_before_pack(name);
-                return Err(error);
-            }
+            Err(error) => return Err(error),
         };
-        let packed = {
-            let uid = account.uid;
-            let gid = account.gid;
-            let home = account.home.clone();
-            let vaults = self.vaults.share();
-            let path = path.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut worker = match worker::HomeWorker::spawn(uid, gid, &home, vaults) {
-                    Ok(worker) => worker,
-                    Err(error) => return Err((true, error)),
-                };
-                worker
-                    .pack(&path, passphrase.as_bytes())
-                    .map_err(|error| (false, error))
-            })
-            .await
-        };
-        match packed {
-            Err(error) => {
-                self.restore_before_pack(name);
-                return Err(failed("locking", &vault_name, error));
+        let uid = account.uid;
+        let gid = account.gid;
+        let home = account.home.clone();
+        let vaults = self.vaults.share();
+        let pack_path = path.clone();
+        let live = Arc::clone(&self.workers);
+        let packed = tokio::task::spawn_blocking(move || {
+            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, live.clone())?;
+            worker.pack(&pack_path, passphrase.as_bytes())
+        })
+        .await
+        .map_err(|error| failed("locking", name, error))?;
+        if let Err(error) = packed {
+            if error.to_string().contains("immutable") {
+                eprintln!("linux-vault-helper: locking for {name}: {error}");
             }
-            Ok(Err((true, error))) => {
-                self.restore_before_pack(name);
-                return Err(error);
-            }
-            Ok(Err((false, error))) => {
-                let _ = self.vaults.finish_lock(name, previous, false);
-                return Err(error);
-            }
-            Ok(Ok(())) => {}
+            return Err(error);
         }
         self.vaults
-            .finish_lock(name, previous, true)
+            .set_state(account.uid, name, State::Locked)
             .map_err(|error| failed("locking", name, error))?;
-        self.passphrases.forget(name)?;
+        rollback.armed = false;
+        self.passphrases.forget(account.uid, name)?;
         Ok(())
     }
 
@@ -585,15 +576,10 @@ impl Helper {
                 "vault name is not a single path component",
             ));
         }
-        let _guard = self.locks.acquire(name).await;
+        self.owned_vault(&account, name).await?;
+        let _vault_lock = self.locks.acquire(account.uid, name).await;
         self.gate.ensure_open()?;
-        let vaults = self.vaults_for(&account)?;
-        let name_owned = name.to_string();
-        let vault_name = name.to_string();
-        let vault = tokio::task::spawn_blocking(move || vaults.get(&name_owned))
-            .await
-            .map_err(|error| failed("unlocking", &vault_name, error))?
-            .map_err(|error| failed("unlocking", name, error))?;
+        let vault = self.owned_vault(&account, name).await?;
         if vault.state != State::Locked {
             return Err(failed(
                 "unlocking",
@@ -609,27 +595,36 @@ impl Helper {
             .map_err(|error| named_pin("asking for the passphrase", name, error))?;
         let path = self
             .vaults
-            .begin_unlock(name)
+            .begin_unlock(account.uid, name)
             .map_err(|error| failed("unlocking", name, error))?;
+        let mut rollback = DiskReconcile {
+            armed: true,
+            uid: account.uid,
+            gid: account.gid,
+            home: account.home.clone(),
+            path: path.clone(),
+            name: name.to_string(),
+            vaults: self.vaults.share(),
+            keys: self.passphrases.clone(),
+            workers: Arc::clone(&self.workers),
+        };
         let uid = account.uid;
         let gid = account.gid;
         let home = account.home.clone();
         let vaults = self.vaults.share();
         let bytes = zeroize::Zeroizing::new(passphrase.as_bytes().to_vec());
-        let unpacked = tokio::task::spawn_blocking(move || {
-            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults)?;
+        let live = Arc::clone(&self.workers);
+        tokio::task::spawn_blocking(move || {
+            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, live.clone())?;
             worker.unpack(&path, &bytes)
         })
         .await
-        .map_err(|error| failed("unlocking", name, error))?;
-        if let Err(error) = unpacked {
-            let _ = self.vaults.finish_unlock(name, false);
-            return Err(error);
-        }
+        .map_err(|error| failed("unlocking", name, error))??;
         self.vaults
-            .finish_unlock(name, true)
+            .set_state(account.uid, name, State::Unlocked)
             .map_err(|error| failed("unlocking", name, error))?;
-        self.keep(name, passphrase)?;
+        rollback.armed = false;
+        self.keep(account.uid, name, passphrase)?;
         self.shutdown_handle().arm_inhibitor().await;
         Ok(())
     }
@@ -650,7 +645,9 @@ impl Helper {
             .map_err(|error| failed("listing", "registry", error))?;
         Ok(listed
             .into_iter()
-            .filter(|vault| caller_owns(&account.home, account.uid, &vault.path))
+            .filter(|vault| {
+                vault.uid == account.uid && caller_owns(&account.home, account.uid, &vault.path)
+            })
             .map(|vault| VaultStatus {
                 name: vault.name,
                 path: vault.path.display().to_string(),
@@ -675,7 +672,8 @@ impl Helper {
                 "vault name is not a single path component",
             ));
         }
-        let _guard = self.locks.acquire(name).await;
+        self.owned_vault(&account, name).await?;
+        let _guard = self.locks.acquire(account.uid, name).await;
         self.gate.ensure_open()?;
         let vault = self.owned_vault(&account, name).await?;
         if matches!(vault.state, State::Locking | State::Unlocking) {
@@ -690,34 +688,44 @@ impl Helper {
                 .map_err(|error| named_pin("asking for the passphrase", name, error))?;
             let path = self
                 .vaults
-                .begin_unlock(name)
+                .begin_unlock(account.uid, name)
                 .map_err(|error| failed("removing", name, error))?;
+            let mut rollback = DiskReconcile {
+                armed: true,
+                uid: account.uid,
+                gid: account.gid,
+                home: account.home.clone(),
+                path: path.clone(),
+                name: name.to_string(),
+                vaults: self.vaults.share(),
+                keys: self.passphrases.clone(),
+                workers: Arc::clone(&self.workers),
+            };
             let uid = account.uid;
             let gid = account.gid;
             let home = account.home.clone();
             let vaults = self.vaults.share();
-            let unpacked = tokio::task::spawn_blocking(move || {
-                let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults)?;
+            let live = Arc::clone(&self.workers);
+            tokio::task::spawn_blocking(move || {
+                let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, live.clone())?;
                 worker.unpack(&path, passphrase.as_bytes())
             })
             .await
-            .map_err(|error| failed("removing", name, error))?;
-            if let Err(error) = unpacked {
-                let _ = self.vaults.finish_unlock(name, false);
-                return Err(error);
-            }
+            .map_err(|error| failed("removing", name, error))??;
             self.vaults
-                .finish_unlock(name, true)
+                .set_state(account.uid, name, State::Unlocked)
                 .map_err(|error| failed("removing", name, error))?;
+            rollback.armed = false;
         }
         let vaults = self.vaults_for(&account)?;
+        let uid = account.uid;
         let name_owned = name.to_string();
         let vault_name = name.to_string();
-        tokio::task::spawn_blocking(move || vaults.unregister(&name_owned))
+        tokio::task::spawn_blocking(move || vaults.unregister(uid, &name_owned))
             .await
             .map_err(|error| failed("removing", &vault_name, error))?
             .map_err(|error| failed("removing", name, error))?;
-        self.passphrases.forget(name)?;
+        self.passphrases.forget(account.uid, name)?;
         Ok(())
     }
 
@@ -737,7 +745,8 @@ impl Helper {
                 "vault name is not a single path component",
             ));
         }
-        let _guard = self.locks.acquire(name).await;
+        self.owned_vault(&account, name).await?;
+        let _guard = self.locks.acquire(account.uid, name).await;
         self.gate.ensure_open()?;
         let vault = self.owned_vault(&account, name).await?;
         if matches!(vault.state, State::Locking | State::Unlocking) {
@@ -761,6 +770,7 @@ impl Helper {
             .await
             .map_err(|error| named_pin("asking for the passphrase", name, error))?;
         let path = vault.path.clone();
+        let live = Arc::clone(&self.workers);
         match vault.state {
             State::Locked => {
                 let uid = account.uid;
@@ -768,15 +778,16 @@ impl Helper {
                 let home = account.home.clone();
                 let vaults = self.vaults.share();
                 let path = path.clone();
+                let workers = live.clone();
                 tokio::task::spawn_blocking(move || {
-                    let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults)?;
+                    let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, workers)?;
                     worker.delete_archive(&path, typed.as_bytes())
                 })
                 .await
                 .map_err(|error| failed("terminating", name, error))??;
             }
             State::Unlocked => {
-                let held = match self.passphrases.read(name) {
+                let held = match self.passphrases.read(account.uid, name) {
                     Ok(held) => held,
                     Err(HelperError::Failed(message)) if passphrase_is_missing(&message) => {
                         return Err(failed("terminating", name, "the passphrase is not held"));
@@ -791,8 +802,9 @@ impl Helper {
                 let home = account.home.clone();
                 let vaults = self.vaults.share();
                 let path = path.clone();
+                let workers = live.clone();
                 tokio::task::spawn_blocking(move || {
-                    let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults)?;
+                    let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, workers)?;
                     worker.delete_folder(&path)
                 })
                 .await
@@ -807,27 +819,109 @@ impl Helper {
             let home = account.home.clone();
             let vaults = self.vaults.share();
             let path = path.clone();
+            let workers = live.clone();
             tokio::task::spawn_blocking(move || {
-                let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults)?;
+                let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, workers)?;
                 worker.remove_bookmark(&path)
             })
             .await
             .map_err(|error| failed("terminating", name, error))??;
         }
         let vaults = self.vaults_for(&account)?;
+        let uid = account.uid;
         let name_owned = name.to_string();
         let vault_name = name.to_string();
-        tokio::task::spawn_blocking(move || vaults.unregister(&name_owned))
+        tokio::task::spawn_blocking(move || vaults.unregister(uid, &name_owned))
             .await
             .map_err(|error| failed("terminating", &vault_name, error))?
             .map_err(|error| failed("terminating", name, error))?;
-        self.passphrases.forget(name)?;
+        self.passphrases.forget(account.uid, name)?;
         Ok(())
     }
 }
 
+struct DiskReconcile {
+    armed: bool,
+    uid: u32,
+    gid: u32,
+    home: PathBuf,
+    path: PathBuf,
+    name: String,
+    vaults: linux_vault::Vaults,
+    keys: HeldPassphrases,
+    workers: Arc<Mutex<Vec<u32>>>,
+}
+
+impl Drop for DiskReconcile {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Err(error) = reconcile_from_disk(
+            &self.vaults,
+            &self.keys,
+            self.uid,
+            self.gid,
+            &self.home,
+            &self.path,
+            &self.name,
+            &self.workers,
+        ) {
+            eprintln!(
+                "linux-vault-helper: reconciling {} for uid {}: {error}",
+                self.name, self.uid
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconcile_from_disk(
+    vaults: &linux_vault::Vaults,
+    keys: &HeldPassphrases,
+    uid: u32,
+    gid: u32,
+    home: &Path,
+    path: &Path,
+    name: &str,
+    workers: &Arc<Mutex<Vec<u32>>>,
+) -> Result<(), HelperError> {
+    let mut worker =
+        worker::HomeWorker::spawn(uid, gid, home, vaults.share(), Arc::clone(workers))?;
+    let facts = worker.inspect(path)?;
+    if !facts.folder && !facts.archive {
+        vaults
+            .unregister(uid, name)
+            .map_err(|error| failed("reconciling", name, error))?;
+        worker.remove_bookmark(path)?;
+        return Ok(());
+    }
+    if facts.archive {
+        vaults
+            .set_state(uid, name, State::Locked)
+            .map_err(|error| failed("reconciling", name, error))?;
+        if let Err(error) = worker.seal(path) {
+            eprintln!("linux-vault-helper: sealing {name} for uid {uid}: {error}");
+        }
+        return Ok(());
+    }
+    let state = if keys.contains(uid, name) {
+        State::Unlocked
+    } else {
+        State::NeedsRecovery
+    };
+    vaults
+        .set_state(uid, name, state)
+        .map_err(|error| failed("reconciling", name, error))
+}
+
 fn failed(step: &str, target: &str, error: impl std::fmt::Display) -> HelperError {
     HelperError::Failed(format!("{step} for {target}: {error}"))
+}
+
+/// Missing and owned by someone else are the same error, with the same text.
+fn vault_not_found() -> HelperError {
+    HelperError::NotFound("vault not found".into())
 }
 
 fn pin_error(error: PinentryError) -> HelperError {
@@ -963,6 +1057,9 @@ pub(crate) fn ids_for_path(path: &Path) -> Option<(u32, u32, PathBuf)> {
 }
 
 pub(crate) fn passwd_account(uid: u32) -> Result<Account, HelperError> {
+    if uid == 0 {
+        return Err(HelperError::Failed("root cannot own a vault".into()));
+    }
     let mut buf_len = 16 * 1024;
     loop {
         let mut pwd = std::mem::MaybeUninit::<nix::libc::passwd>::zeroed();
@@ -1026,6 +1123,88 @@ mod compare_tests {
         assert!(!constant_time_eq(b"secret", b"secres"));
         assert!(!constant_time_eq(b"secret", b"secret2"));
         assert!(!constant_time_eq(b"", b"secret"));
+    }
+}
+
+#[cfg(test)]
+mod root_owner {
+    use super::passwd_account;
+
+    #[test]
+    fn root_cannot_own_a_vault() {
+        match passwd_account(0) {
+            Ok(_) => panic!("root was accepted"),
+            Err(error) => assert!(
+                error.to_string().contains("root cannot own a vault"),
+                "{error}"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod not_found {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+
+    use super::{Account, Authorizer, Helper, Prompt};
+    use zbus::DBusError;
+
+    fn account(uid: u32, home: std::path::PathBuf) -> Account {
+        Account {
+            user: format!("u{uid}"),
+            uid,
+            gid: uid,
+            home,
+        }
+    }
+
+    fn shows_not_found(error: &super::HelperError) -> bool {
+        error.name().as_str() == "org.linuxvault.Error.NotFound"
+            && error.description() == Some("vault not found")
+    }
+
+    #[tokio::test]
+    async fn someone_elses_vault_matches_a_missing_name() {
+        let dir = std::env::temp_dir().join(format!("lve-notfound-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(dir.join("home")).unwrap();
+        fs::create_dir_all(dir.join("elsewhere")).unwrap();
+        let home = dir.join("home").canonicalize().unwrap();
+        let elsewhere = dir.join("elsewhere").canonicalize().unwrap();
+        let folder = home.join("Forge");
+        fs::create_dir(&folder).unwrap();
+        let (vaults, _) = linux_vault::Vaults::open(dir.join("registry"), &home)
+            .unwrap()
+            .trace_immutable_flag();
+        let helper = Helper::new(
+            Authorizer::Allow,
+            vaults,
+            Prompt::Program(vec!["/bin/true".into()]),
+            account(10, home.clone()),
+        )
+        .unwrap();
+        helper.vaults.register_unlocked(10, &folder).unwrap();
+        let owner = account(10, home);
+        let other = account(20, elsewhere);
+        let missing = helper.owned_vault(&owner, "NoSuch").await.unwrap_err();
+        let foreign = helper.owned_vault(&other, "Forge").await.unwrap_err();
+        // The file is owned by this process, not uid 10, so the registered
+        // name is also refused.
+        assert_ne!(
+            fs::metadata(&folder).unwrap().uid(),
+            owner.uid,
+            "the fixture must not be owned by the registry uid"
+        );
+        let mismatched = helper.owned_vault(&owner, "Forge").await.unwrap_err();
+        assert!(shows_not_found(&missing), "{missing}");
+        assert_eq!(missing.to_string(), foreign.to_string());
+        assert_eq!(missing.name().as_str(), foreign.name().as_str());
+        assert_eq!(missing.description(), foreign.description());
+        assert_eq!(missing.to_string(), mismatched.to_string());
+        assert_eq!(missing.description(), mismatched.description());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

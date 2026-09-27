@@ -81,9 +81,13 @@ async fn an_empty_registry_lists_nothing_and_remove_finds_no_vault() {
     let proxy = proxy(&client).await;
     assert!(proxy.list().await.unwrap().is_empty());
     let removed = proxy.remove("Forge").await.unwrap_err().to_string();
-    assert!(removed.contains("vault not found"), "{removed}");
     let terminated = proxy.terminate("Forge").await.unwrap_err().to_string();
-    assert!(terminated.contains("vault not found"), "{terminated}");
+    assert_eq!(removed, terminated);
+    assert!(
+        removed.contains("org.linuxvault.Error.NotFound"),
+        "{removed}"
+    );
+    assert!(removed.contains("vault not found"), "{removed}");
 }
 
 #[tokio::test]

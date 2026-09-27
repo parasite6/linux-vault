@@ -20,8 +20,10 @@ mod immutable;
 mod registry;
 mod sevenz;
 
+pub use sevenz::close_extra_fds;
+
 use std::fs::{self, File};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -111,6 +113,7 @@ pub struct Reconciled {
 /// A registered vault. `path` is the plaintext folder, present or not.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Vault {
+    pub uid: u32,
     pub name: String,
     pub path: PathBuf,
     pub state: State,
@@ -120,6 +123,8 @@ pub struct Vault {
 pub struct Vaults {
     registry_dir: PathBuf,
     allowed_root: PathBuf,
+    /// Core methods act for this uid. The helper passes the caller explicitly.
+    owner_uid: u32,
     seven_zip: PathBuf,
     /// Serializes `flock` calls. Two flocks on different descriptors in one
     /// process block each other, including on the same thread.
@@ -141,10 +146,12 @@ impl Vaults {
     pub fn open(registry_dir: impl Into<PathBuf>, allowed_root: impl AsRef<Path>) -> Result<Self> {
         let registry_dir = registry_dir.into();
         fs::create_dir_all(&registry_dir)?;
+        let _ = fs::set_permissions(&registry_dir, fs::Permissions::from_mode(0o700));
         let allowed_root = allowed_root.as_ref().canonicalize()?;
         Ok(Self {
             registry_dir,
             allowed_root,
+            owner_uid: current_uid(),
             seven_zip: find_seven_zip()?,
             registry_gate: Arc::new(Mutex::new(())),
             run_as: None,
@@ -161,6 +168,7 @@ impl Vaults {
         Ok(Self {
             registry_dir: self.registry_dir.clone(),
             allowed_root: allowed_root.as_ref().canonicalize()?,
+            owner_uid: self.owner_uid,
             seven_zip: self.seven_zip.clone(),
             registry_gate: Arc::clone(&self.registry_gate),
             run_as: self.run_as,
@@ -174,6 +182,7 @@ impl Vaults {
         Self {
             registry_dir: self.registry_dir.clone(),
             allowed_root: self.allowed_root.clone(),
+            owner_uid: self.owner_uid,
             seven_zip: self.seven_zip.clone(),
             registry_gate: Arc::clone(&self.registry_gate),
             run_as: self.run_as,
@@ -190,6 +199,7 @@ impl Vaults {
         Self {
             registry_dir: self.registry_dir.clone(),
             allowed_root: self.allowed_root.clone(),
+            owner_uid: self.owner_uid,
             seven_zip: self.seven_zip.clone(),
             registry_gate: Arc::clone(&self.registry_gate),
             run_as: None,
@@ -203,6 +213,7 @@ impl Vaults {
         Self {
             registry_dir: self.registry_dir.clone(),
             allowed_root: self.allowed_root.clone(),
+            owner_uid: self.owner_uid,
             seven_zip: self.seven_zip.clone(),
             registry_gate: Arc::clone(&self.registry_gate),
             run_as: self.run_as,
@@ -219,6 +230,7 @@ impl Vaults {
         Self {
             registry_dir: self.registry_dir.clone(),
             allowed_root: self.allowed_root.clone(),
+            owner_uid: self.owner_uid,
             seven_zip: self.seven_zip.clone(),
             registry_gate: Arc::clone(&self.registry_gate),
             run_as: Some(Credentials { uid, gid }),
@@ -240,6 +252,7 @@ impl Vaults {
         let vaults = Self {
             registry_dir: self.registry_dir.clone(),
             allowed_root: self.allowed_root.clone(),
+            owner_uid: self.owner_uid,
             seven_zip: self.seven_zip.clone(),
             registry_gate: Arc::clone(&self.registry_gate),
             run_as: self.run_as,
@@ -247,6 +260,12 @@ impl Vaults {
             stop_extract: Arc::clone(&self.stop_extract),
         };
         (vaults, ImmutableTrace { calls })
+    }
+
+    /// The `7z` binary this process will run. The helper resolves it once and
+    /// the worker uses that path instead of searching `PATH` again.
+    pub fn seven_zip(&self) -> &Path {
+        &self.seven_zip
     }
 
     /// Use this `7z` binary instead of the one found on `PATH`.
@@ -264,8 +283,10 @@ impl Vaults {
         if archive_for(&path).exists() {
             return Err(Error::AlreadyExists);
         }
+        let uid = self.owner_uid;
         self.write(|registry| {
             registry.insert(Record {
+                uid,
                 name: name.clone(),
                 path: path.clone(),
                 state: State::Unlocked,
@@ -273,6 +294,7 @@ impl Vaults {
             Ok(())
         })?;
         Ok(Vault {
+            uid,
             name,
             path,
             state: State::Unlocked,
@@ -284,7 +306,13 @@ impl Vaults {
     }
 
     pub fn get(&self, name: &str) -> Result<Vault> {
-        self.read(|registry| registry.get(name).map(Vault::from))
+        self.get_for(self.owner_uid, name)
+    }
+
+    /// One vault belonging to `uid`. A different user's vault with the same
+    /// folder name is not this one.
+    pub fn get_for(&self, uid: u32, name: &str) -> Result<Vault> {
+        self.read(|registry| registry.get(uid, name).map(Vault::from))
     }
 
     /// Apply recovery from the filenames in each vault's parent directory.
@@ -307,11 +335,14 @@ impl Vaults {
     /// The filenames decide the state, same as any other restart.
     pub fn reconcile(&self) -> Result<Reconciled> {
         let (listed, locked, removed) = self.write(|registry| {
-            let names: Vec<String> = registry.iter().map(|record| record.name.clone()).collect();
+            let keys: Vec<(u32, String)> = registry
+                .iter()
+                .map(|record| (record.uid, record.name.clone()))
+                .collect();
             let mut locked = Vec::new();
             let mut removed = Vec::new();
-            for name in names {
-                let record = registry.get(&name)?.clone();
+            for (uid, name) in keys {
+                let record = registry.get(uid, &name)?.clone();
                 let parent = parent_dir(&record.path)?;
                 let unlocking = parent.join(unlocking_file_name(&record.path)?);
                 let partial = parent.join(partial_file_name(&record.path)?);
@@ -324,7 +355,7 @@ impl Vaults {
                 let folder = record.path.is_dir();
                 let archive = archive_for(&record.path).is_file();
                 if !folder && !archive {
-                    registry.remove(&name)?;
+                    registry.remove(uid, &name)?;
                     removed.push(record.path);
                     sync_dir(&parent)?;
                     continue;
@@ -341,7 +372,7 @@ impl Vaults {
                 if state == State::Locked {
                     locked.push(record.path.clone());
                 }
-                registry.get_mut(&name)?.state = state;
+                registry.get_mut(uid, &name)?.state = state;
             }
             Ok((registry.iter().map(Vault::from).collect(), locked, removed))
         })?;
@@ -355,9 +386,9 @@ impl Vaults {
     }
 
     /// The folder is still plaintext and this process has no passphrase for it.
-    pub fn mark_needs_recovery(&self, name: &str) -> Result<()> {
+    pub fn mark_needs_recovery(&self, uid: u32, name: &str) -> Result<()> {
         self.write(|registry| {
-            let entry = registry.get_mut(name)?;
+            let entry = registry.get_mut(uid, name)?;
             if matches!(entry.state, State::Unlocked | State::NeedsRecovery) {
                 entry.state = State::NeedsRecovery;
             }
@@ -378,8 +409,9 @@ impl Vaults {
     /// archive is removed and the folder stays.
     pub fn lock(&self, name: &str, passphrase: &[u8]) -> Result<()> {
         check_passphrase(passphrase)?;
+        let uid = self.owner_uid;
         let record = self.write(|registry| {
-            let record = registry.get(name)?.clone();
+            let record = registry.get(uid, name)?.clone();
             match record.state {
                 State::Unlocked | State::NeedsRecovery => {}
                 state => {
@@ -400,14 +432,14 @@ impl Vaults {
             if archive_for(&record.path).exists() {
                 return Err(Error::AlreadyExists);
             }
-            registry.get_mut(name)?.state = State::Locking;
+            registry.get_mut(uid, name)?.state = State::Locking;
             Ok((record, parent))
         })?;
         let (record, parent) = record;
         let packed = self.pack(&record, &parent, passphrase);
         let previous = record.state;
         self.write(|registry| {
-            let entry = registry.get_mut(name)?;
+            let entry = registry.get_mut(uid, name)?;
             entry.state = if packed.is_ok()
                 || (!record.path.exists() && archive_for(&record.path).is_file())
             {
@@ -468,7 +500,8 @@ impl Vaults {
     /// Test the archive with `7z t`. Does not change the vault.
     pub fn test(&self, name: &str, passphrase: &[u8]) -> Result<()> {
         check_passphrase(passphrase)?;
-        let record = self.read(|registry| Ok(registry.get(name)?.clone()))?;
+        let uid = self.owner_uid;
+        let record = self.read(|registry| Ok(registry.get(uid, name)?.clone()))?;
         if record.state != State::Locked {
             return Err(Error::InvalidState {
                 state: record.state,
@@ -488,8 +521,9 @@ impl Vaults {
     /// leaves the archive as the only copy.
     pub fn unlock(&self, name: &str, passphrase: &[u8]) -> Result<()> {
         check_passphrase(passphrase)?;
+        let uid = self.owner_uid;
         let record = self.write(|registry| {
-            let record = registry.get(name)?.clone();
+            let record = registry.get(uid, name)?.clone();
             if record.state != State::Locked {
                 return Err(Error::InvalidState {
                     state: record.state,
@@ -506,12 +540,12 @@ impl Vaults {
                     "vault archive is missing",
                 )));
             }
-            registry.get_mut(name)?.state = State::Unlocking;
+            registry.get_mut(uid, name)?.state = State::Unlocking;
             Ok(record)
         })?;
         let extracted = self.extract(&record, passphrase);
         self.write(|registry| {
-            let entry = registry.get_mut(name)?;
+            let entry = registry.get_mut(uid, name)?;
             entry.state = if extracted.is_ok()
                 || (record.path.is_dir() && !archive_for(&record.path).exists())
             {
@@ -532,8 +566,15 @@ impl Vaults {
         let extracted = self.extract_cleared(record, passphrase, &archive, &parent, &archive_name);
         if extracted.is_err() {
             // The archive cannot be deleted while immutable, so the flag was
-            // cleared first. A wrong passphrase or any other failure puts it back.
-            let _ = self.mark_immutable(&record.path, true);
+            // cleared first. A wrong passphrase or any other failure puts it
+            // back. The worker does this through the helper: it sends the
+            // archive descriptor, and the helper runs the ioctl.
+            if let Err(error) = self.mark_immutable(&record.path, true) {
+                eprintln!(
+                    "linux-vault: restoring the immutable flag on {}: {error}",
+                    archive.display()
+                );
+            }
         }
         extracted
     }
@@ -615,13 +656,14 @@ impl Vaults {
     /// Register a folder the worker has already created and canonicalized.
     ///
     /// Does not open the path. The worker checked that it is inside the home.
-    pub fn register_unlocked(&self, path: &Path) -> Result<Vault> {
+    pub fn register_unlocked(&self, uid: u32, path: &Path) -> Result<Vault> {
         let name = vault_name(path)?;
         if path != self.allowed_root && !path.starts_with(&self.allowed_root) {
             return Err(Error::OutsideRoot);
         }
         self.write(|registry| {
             registry.insert(Record {
+                uid,
                 name: name.clone(),
                 path: path.to_path_buf(),
                 state: State::Unlocked,
@@ -629,6 +671,7 @@ impl Vaults {
             Ok(())
         })?;
         Ok(Vault {
+            uid,
             name,
             path: path.to_path_buf(),
             state: State::Unlocked,
@@ -636,9 +679,9 @@ impl Vaults {
     }
 
     /// Mark a lock as started. Does not look at the home directory.
-    pub fn begin_lock(&self, name: &str) -> Result<(PathBuf, State)> {
+    pub fn begin_lock(&self, uid: u32, name: &str) -> Result<(PathBuf, State)> {
         self.write(|registry| {
-            let record = registry.get(name)?.clone();
+            let record = registry.get(uid, name)?.clone();
             match record.state {
                 State::Unlocked | State::NeedsRecovery => {}
                 state => {
@@ -648,42 +691,42 @@ impl Vaults {
                     })
                 }
             }
-            registry.get_mut(name)?.state = State::Locking;
+            registry.get_mut(uid, name)?.state = State::Locking;
             Ok((record.path, record.state))
         })
     }
 
-    pub fn finish_lock(&self, name: &str, previous: State, ok: bool) -> Result<()> {
+    pub fn finish_lock(&self, uid: u32, name: &str, previous: State, ok: bool) -> Result<()> {
         self.write(|registry| {
-            registry.get_mut(name)?.state = if ok { State::Locked } else { previous };
+            registry.get_mut(uid, name)?.state = if ok { State::Locked } else { previous };
             Ok(())
         })
     }
 
-    pub fn begin_unlock(&self, name: &str) -> Result<PathBuf> {
+    pub fn begin_unlock(&self, uid: u32, name: &str) -> Result<PathBuf> {
         self.write(|registry| {
-            let record = registry.get(name)?.clone();
+            let record = registry.get(uid, name)?.clone();
             if record.state != State::Locked {
                 return Err(Error::InvalidState {
                     state: record.state,
                     operation: "unlock",
                 });
             }
-            registry.get_mut(name)?.state = State::Unlocking;
+            registry.get_mut(uid, name)?.state = State::Unlocking;
             Ok(record.path)
         })
     }
 
-    pub fn finish_unlock(&self, name: &str, ok: bool) -> Result<()> {
+    pub fn finish_unlock(&self, uid: u32, name: &str, ok: bool) -> Result<()> {
         self.write(|registry| {
-            registry.get_mut(name)?.state = if ok { State::Unlocked } else { State::Locked };
+            registry.get_mut(uid, name)?.state = if ok { State::Unlocked } else { State::Locked };
             Ok(())
         })
     }
 
-    pub fn set_state(&self, name: &str, state: State) -> Result<()> {
+    pub fn set_state(&self, uid: u32, name: &str, state: State) -> Result<()> {
         self.write(|registry| {
-            registry.get_mut(name)?.state = state;
+            registry.get_mut(uid, name)?.state = state;
             Ok(())
         })
     }
@@ -700,6 +743,7 @@ impl Vaults {
         refuse_escaping_symlinks(folder)?;
         let parent = parent_dir(folder)?;
         let record = Record {
+            uid: 0,
             name: vault_name(folder)?,
             path: folder.to_path_buf(),
             state: State::Unlocked,
@@ -711,6 +755,7 @@ impl Vaults {
     pub fn unpack_folder(&self, folder: &Path, passphrase: &[u8]) -> Result<()> {
         check_passphrase(passphrase)?;
         let record = Record {
+            uid: 0,
             name: vault_name(folder)?,
             path: folder.to_path_buf(),
             state: State::Locked,
@@ -793,13 +838,14 @@ impl Vaults {
     /// The registry entry is removed only after the bytes are gone.
     pub fn delete(&self, name: &str, passphrase: Option<&[u8]>) -> Result<()> {
         self.delete_contents(name, passphrase)?;
-        self.unregister(name)
+        self.unregister(self.owner_uid, name)
     }
 
     /// Delete the archive or the plaintext folder. The registry entry stays,
     /// so a crash before [`Self::unregister`] still names the vault.
     pub fn delete_contents(&self, name: &str, passphrase: Option<&[u8]>) -> Result<()> {
-        let record = self.read(|registry| Ok(registry.get(name)?.clone()))?;
+        let uid = self.owner_uid;
+        let record = self.read(|registry| Ok(registry.get(uid, name)?.clone()))?;
         match (record.state, passphrase) {
             (State::Locked, Some(passphrase)) => {
                 check_passphrase(passphrase)?;
@@ -842,9 +888,9 @@ impl Vaults {
     }
 
     /// Drop the registry entry. The folder, archive, and bookmark stay.
-    pub fn unregister(&self, name: &str) -> Result<()> {
+    pub fn unregister(&self, uid: u32, name: &str) -> Result<()> {
         self.write(|registry| {
-            registry.remove(name)?;
+            registry.remove(uid, name)?;
             Ok(())
         })
     }
@@ -915,11 +961,16 @@ pub struct FilenameFacts {
 impl From<&Record> for Vault {
     fn from(record: &Record) -> Self {
         Self {
+            uid: record.uid,
             name: record.name.clone(),
             path: record.path.clone(),
             state: record.state,
         }
     }
+}
+
+fn current_uid() -> u32 {
+    unsafe { libc::geteuid() }
 }
 
 fn check_passphrase(passphrase: &[u8]) -> Result<()> {

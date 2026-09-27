@@ -8,6 +8,9 @@ pub enum HelperError {
     Zbus(zbus::Error),
     /// Polkit denied the call, or the caller's credentials could not be read.
     NotAuthorized(String),
+    /// No vault of this name is registered for the caller. A name that belongs
+    /// to someone else is this same error.
+    NotFound(String),
     /// The checks passed. This method is not connected yet.
     NotImplemented(String),
     /// The user dismissed the prompt.

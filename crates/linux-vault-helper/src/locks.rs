@@ -27,11 +27,12 @@ impl VaultLocks {
     }
 
     /// Wait until no other operation holds `name`, then hold it.
-    pub async fn acquire(&self, name: &str) -> VaultGuard {
+    pub async fn acquire(&self, uid: u32, name: &str) -> VaultGuard {
+        let key = format!("{uid}\0{name}");
         let vault = {
             let mut vaults = self.vaults.lock().await;
             vaults
-                .entry(name.to_string())
+                .entry(key)
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
@@ -51,10 +52,10 @@ mod tests {
     #[tokio::test]
     async fn one_vault_is_exclusive_and_two_vaults_overlap() {
         let locks = Arc::new(VaultLocks::new());
-        let first = locks.acquire("Forge").await;
+        let first = locks.acquire(1, "Forge").await;
         let other = Arc::clone(&locks);
         let overlapped = tokio::spawn(async move {
-            let _guard = other.acquire("Anvil").await;
+            let _guard = other.acquire(1, "Anvil").await;
         });
         tokio::time::timeout(Duration::from_secs(1), overlapped)
             .await
@@ -63,7 +64,7 @@ mod tests {
 
         let waiting = Arc::clone(&locks);
         let blocked = tokio::spawn(async move {
-            let _guard = waiting.acquire("Forge").await;
+            let _guard = waiting.acquire(1, "Forge").await;
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!blocked.is_finished());

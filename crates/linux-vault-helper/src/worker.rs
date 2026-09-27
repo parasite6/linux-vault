@@ -45,9 +45,65 @@ extern "C" fn on_term(_: i32) {
     STOP.store(true, Ordering::SeqCst);
 }
 
+/// Clear the effective, permitted, and inheritable sets.
+///
+/// The helper keeps `CAP_LINUX_IMMUTABLE` and sets the flag on a descriptor
+/// this process sends. A worker that stayed root would otherwise still have
+/// that capability and could set the flag itself.
+fn drop_capabilities() -> Result<(), String> {
+    const VERSION_3: u32 = 0x2008_0522;
+    const SYS_CAPGET: i64 = 125;
+    const SYS_CAPSET: i64 = 126;
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let rc = unsafe {
+        let mut header = Header {
+            version: VERSION_3,
+            pid: 0,
+        };
+        let mut data: [Data; 2] = std::mem::zeroed();
+        if nix::libc::syscall(SYS_CAPGET, &mut header, data.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        data = std::mem::zeroed();
+        nix::libc::syscall(SYS_CAPSET, &header, data.as_ptr())
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    Ok(())
+}
+
 /// Entry point for `--worker`. The socket is fd 3. Dumpable is cleared first.
 pub fn run() -> i32 {
     crate::disable_core_dumps().ok();
+    // setuid to a normal user already clears capabilities. Clearing them
+    // again covers a worker whose uid is 0: it must not be able to change
+    // the immutable flag. The helper does that on the descriptor this
+    // process sends.
+    if let Err(error) = drop_capabilities() {
+        let _ = std::io::stderr().write_all(
+            format!("linux-vault-helper: worker: dropping capabilities: {error}\n").as_bytes(),
+        );
+        return 1;
+    }
+    // The helper's dup2 left fd 3 without close-on-exec so this exec could
+    // receive it. Children of the worker, including 7z, must not inherit it.
+    let flags = unsafe { nix::libc::fcntl(3, nix::libc::F_GETFD) };
+    if flags >= 0 {
+        unsafe {
+            nix::libc::fcntl(3, nix::libc::F_SETFD, flags | nix::libc::FD_CLOEXEC);
+        }
+    }
     unsafe {
         nix::libc::signal(
             nix::libc::SIGTERM,
@@ -64,8 +120,17 @@ pub fn run() -> i32 {
 }
 
 fn serve(mut sock: UnixStream) -> Result<(), String> {
-    let home = match read_frame(&mut sock) {
-        Ok((OK, body, _)) => PathBuf::from(String::from_utf8_lossy(&body).as_ref()),
+    let (home, seven_zip) = match read_frame(&mut sock) {
+        Ok((OK, body, _)) => {
+            let text = String::from_utf8_lossy(&body);
+            let mut parts = text.split('\0');
+            let home = PathBuf::from(parts.next().unwrap_or(""));
+            let seven_zip = parts
+                .next()
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+            (home, seven_zip)
+        }
         Ok((ERR, body, _)) => return Err(String::from_utf8_lossy(&body).into_owned()),
         Ok(_) => return Err("worker expected a home path".into()),
         Err(error) => return Err(error.to_string()),
@@ -73,8 +138,11 @@ fn serve(mut sock: UnixStream) -> Result<(), String> {
     write_frame(&mut sock, OK, &[], None)
         .map_err(|error| format!("starting worker for {}: {error}", home.display()))?;
     let registry = home.join(format!(".lve-worker-{}", std::process::id()));
-    let opened = Vaults::open(&registry, &home)
+    let mut opened = Vaults::open(&registry, &home)
         .map_err(|error| format!("opening worker registry for {}: {error}", home.display()))?;
+    if let Some(path) = seven_zip {
+        opened.set_seven_zip(path);
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let watch = Arc::clone(&stop);
     thread::spawn(move || {
@@ -272,10 +340,17 @@ pub struct HomeWorker {
     sock: UnixStream,
     uid: u32,
     vaults: Vaults,
+    live: Arc<Mutex<Vec<u32>>>,
 }
 
 impl HomeWorker {
-    pub fn spawn(uid: u32, gid: u32, home: &Path, vaults: Vaults) -> Result<Self, HelperError> {
+    pub fn spawn(
+        uid: u32,
+        gid: u32,
+        home: &Path,
+        vaults: Vaults,
+        live: Arc<Mutex<Vec<u32>>>,
+    ) -> Result<Self, HelperError> {
         let (ours, theirs) = UnixStream::pair().map_err(|error| {
             HelperError::Failed(format!(
                 "starting worker for {home}: {error}",
@@ -304,15 +379,18 @@ impl HomeWorker {
         let child = command.spawn().map_err(|error| {
             HelperError::Failed(format!("starting worker for {}: {error}", home.display()))
         })?;
+        remember_worker(&live, child.id());
         drop(theirs);
+        let home_body = format!("{}\0{}", home.display(), vaults.seven_zip().display());
         let mut worker = Self {
             child,
             sock: ours,
             uid,
             vaults,
+            live,
         };
         worker
-            .roundtrip(OK, home.to_string_lossy().as_bytes())
+            .roundtrip(OK, home_body.as_bytes())
             .map_err(|error| {
                 HelperError::Failed(format!(
                     "starting worker for {}: {}",
@@ -472,8 +550,48 @@ impl HomeWorker {
 
 impl Drop for HomeWorker {
     fn drop(&mut self) {
+        forget_worker(&self.live, self.child.id());
         drop(self.sock.shutdown(std::net::Shutdown::Both));
         let _ = self.child.wait();
+    }
+}
+
+fn remember_worker(live: &Mutex<Vec<u32>>, pid: u32) {
+    live.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(pid);
+}
+
+fn forget_worker(live: &Mutex<Vec<u32>>, pid: u32) {
+    live.lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|existing| *existing != pid);
+}
+
+/// SIGTERM each worker of this helper so an extract stops and the immutable flag is restored.
+pub fn abort_live_workers(live: &Mutex<Vec<u32>>) {
+    let pids = live
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    for pid in pids {
+        unsafe {
+            nix::libc::kill(pid as i32, nix::libc::SIGTERM);
+        }
+    }
+}
+
+pub fn wait_for_workers(live: &Mutex<Vec<u32>>, timeout: Duration) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < timeout {
+        let empty = live
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty();
+        if empty {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -495,6 +613,11 @@ fn step_error(step: &str, path: &Path, error: HelperError) -> HelperError {
 }
 
 fn worker_program() -> PathBuf {
+    // Tests copy the helper out of a mode 700 home before dropping
+    // CAP_DAC_OVERRIDE. The installed binary is already outside any home.
+    if let Some(path) = std::env::var_os("LVE_HELPER_BIN") {
+        return PathBuf::from(path);
+    }
     if let Some(path) = std::env::var_os("CARGO_BIN_EXE_linux_vault_helper") {
         return PathBuf::from(path);
     }
