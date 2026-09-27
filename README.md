@@ -16,12 +16,13 @@ The package is `linux-vault`. It depends on `7zip` and `pinentry-qt`.
 sudo dnf install linux-vault-0.1.8-1.fc44.x86_64.rpm
 ```
 
-That installs `lve`, the helper at `/usr/libexec/linux-vault-helper`, and the systemd unit `linux-vault-helper.service`. The unit starts on the system bus as `org.linuxvault.Helper`. An upgrade does not restart the helper, so a `dnf upgrade` does not drop passphrases that are still held. The running helper starts its workers from the image it was started with, so a shutdown before the next restart can still lock. The new helper takes effect at the next boot, or when you restart the service yourself. A restart locks every vault that is still unlocked.
+That installs `lve`, the helper at `/usr/libexec/linux-vault-helper` (mode 0711, so other users can run it but cannot read it), and the systemd unit `linux-vault-helper.service`. The unit starts on the system bus as `org.linuxvault.Helper`. An upgrade does not restart the helper, so a `dnf upgrade` does not drop passphrases that are still held. The running helper starts its workers from the image it was started with, so a shutdown before the next restart can still lock. The new helper takes effect at the next boot, or when you restart the service yourself. A restart locks every unlocked vault that contains a file. An empty vault is left as it is.
 
 The package also sets `kernel.yama.ptrace_scope=1`, so one process running as you cannot attach to another. A later file in `/etc/sysctl.d/` can override that.
 
-## Platform. 
-linux-vault v0.1 is built and tested only on Fedora Workstation (Fedora 44, x86_64). It depends on systemd (logind, user services), 7-Zip, and pinentry-qt, and ships as an RPM. Fedora Atomic desktops (Silverblue, Kinoite) are not supported, because home directories live under /var/home. Other distributions may work with manual setup, but they are untested and not officially unsupported.
+## Platform
+
+linux-vault v0.1 is built and tested only on Fedora Workstation (Fedora 44, x86_64). It depends on systemd (logind, user services), 7-Zip, and pinentry-qt, and ships as an RPM. Fedora Atomic desktops (Silverblue, Kinoite) are not supported, because home directories live under `/var/home`. Other distributions may work with manual setup, but they are untested and not officially supported.
 
 ## Use
 
@@ -34,11 +35,13 @@ lve remove Example
 lve terminate Example
 ```
 
-`create ~/Example` registers the folder, adds a Nautilus bookmark, and asks for the passphrase twice. The folder stays plaintext until you lock it. The bookmark keeps pointing at the folder, so Nautilus shows it as missing while the vault is locked. Lock and unlock put that line back if it is missing. Terminate removes only that line.
+`create ~/Example` registers the folder, adds a Nautilus bookmark, and asks for the passphrase twice. A relative path is made absolute before it is sent. The folder stays plaintext until you lock it. The bookmark keeps pointing at the folder, so Nautilus shows it as missing while the vault is locked. Lock and unlock put that line back if it is missing. Terminate removes only that line.
 
-`lock Example` packs `~/Example` into `~/Example.7z` and deletes the folder. It does not ask for the passphrase. After a crash, when the helper no longer holds the key, lock asks twice and then packs. A vault with no files, including one that contains only empty folders, is refused: `Example is empty; nothing to lock.` The vault stays as it is.
+Create refuses a folder that is inside a vault you already have, or that contains one. The terminal says `Cannot create Example: it is inside vault Other.` or `Cannot create Example: it contains vault Other.` `lve` exits 13. `Example` and `Example2` are both allowed. Create also refuses when `Example.7z` is already there.
 
-`unlock Example` asks once, extracts the archive back to `~/Example`, and deletes the archive. The helper keeps the passphrase for the next lock.
+`lock Example` packs `~/Example` into `~/Example.7z` and deletes the folder. It does not ask for the passphrase. After a crash, when the helper no longer holds the key, lock asks twice and then packs. A vault with no files, including one that contains only empty folders, is refused: `Example is empty; nothing to lock.` The vault stays as it is. Lock also refuses when `Example.7z` is already present and is not this vault's archive. The plaintext folder is left in place.
+
+`unlock Example` asks once, extracts the archive back to `~/Example`, and deletes the archive. Unlock refuses when `Example` already exists and is not empty. The helper keeps the passphrase for the next lock.
 
 `ls` lists only your vaults. A vault can be `unlocked`, `locked`, `locked (not immutable)`, `needs_recovery`, `locking`, or `unlocking`. `locked (not immutable)` means the archive is there, and this filesystem would not take the immutable flag, so the archive can still be deleted.
 
@@ -48,7 +51,7 @@ lve terminate Example
 
 Each vault has its own passphrase and its own name. Two people can each have a vault called Example. Neither can lock, unlock, remove, or terminate the other's. That name looks the same as a name that does not exist: `org.linuxvault.Error.NotFound`, with the text `vault not found`. `lve` exits 11. `lve ls` simply omits the other person's vaults.
 
-Root cannot own a vault.
+Root cannot own a vault. Create refuses a folder owned by root.
 
 Add `--json` for one JSON object per line on stdout. `ls` writes a `vault` line for each vault. Lock and unlock write a status line while the state is `locking` or `unlocking`, then a `locked` or `unlocked` line. The status is that state, not a percentage. Vaults that need recovery are reported on stderr, so a parser of stdout is left alone. With `--json` that report is `{"type":"recovery_needed","vault":"Example"}`.
 
