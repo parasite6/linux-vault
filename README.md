@@ -107,4 +107,4 @@ Gui coming soon
 
 GPL-3.0-only. See [LICENSE](LICENSE).
 
-_A substantional amount of the code in this repository was generated/produced with or by AI with a human in the loop._
+_A substantial amount of the code in this repository was generated/produced with or by AI with a human in the loop._
