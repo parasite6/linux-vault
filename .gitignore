@@ -10,7 +10,8 @@ target/
 *.o
 *.so
 *.a
-
+.cursor/rules
+.cursor/
 # Python
 __pycache__/
 *.py[cod]
