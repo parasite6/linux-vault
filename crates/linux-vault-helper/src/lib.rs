@@ -153,6 +153,8 @@ pub struct Helper {
     cancel: CancelToken,
     shutdown: ShutdownHandle,
     workers: Arc<Mutex<Vec<u32>>>,
+    /// Test seam. Runs after the ownership check and before a registry write.
+    before_mutation: std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl Helper {
@@ -217,9 +219,31 @@ impl Helper {
             cancel,
             shutdown,
             workers,
+            before_mutation: std::sync::Mutex::new(None),
         };
         helper.reconcile_with_workers()?;
         Ok(helper)
+    }
+
+    /// Run `hook` after the ownership check and before `begin_lock`,
+    /// `begin_unlock`, or `unregister`. Tests use this to drop the record
+    /// in that gap. The installed service never sets it.
+    pub fn set_before_mutation(&self, hook: impl Fn() + Send + Sync + 'static) {
+        *self
+            .before_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(std::sync::Arc::new(hook));
+    }
+
+    fn before_mutation(&self) {
+        let hook = self
+            .before_mutation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     /// One worker per user. The worker checks filenames; this process writes
@@ -228,7 +252,7 @@ impl Helper {
         let listed = self
             .vaults
             .list()
-            .map_err(|error| failed("reconciling", "registry", error))?;
+            .map_err(|error| vault_error("reconciling", "registry", error))?;
         let mut groups: Vec<(Account, Vec<linux_vault::Vault>)> = Vec::new();
         for vault in listed {
             let account = self.owner_for(&vault.path)?;
@@ -254,7 +278,7 @@ impl Helper {
                 if !facts.folder && !facts.archive {
                     self.vaults
                         .unregister(vault.uid, &vault.name)
-                        .map_err(|error| failed("reconciling", &vault.name, error))?;
+                        .map_err(|error| vault_error("reconciling", &vault.name, error))?;
                     worker.remove_bookmark(&vault.path)?;
                     continue;
                 }
@@ -265,7 +289,7 @@ impl Helper {
                 };
                 self.vaults
                     .set_state(vault.uid, &vault.name, state)
-                    .map_err(|error| failed("reconciling", &vault.name, error))?;
+                    .map_err(|error| vault_error("reconciling", &vault.name, error))?;
                 if facts.archive {
                     worker.seal(&vault.path)?;
                 }
@@ -354,14 +378,39 @@ impl Helper {
         let vault = tokio::task::spawn_blocking(move || vaults.get_for(uid, &name_owned))
             .await
             .map_err(|error| failed("reading the registry", &vault_name, error))?
-            .map_err(|error| match error {
-                linux_vault::Error::NotFound => vault_not_found(),
-                other => failed("reading the registry", name, other),
-            })?;
-        if !caller_owns(&account.home, account.uid, &vault.path) {
+            .map_err(|error| vault_error("reading the registry", name, error))?;
+        self.confirm_owner(account, &vault.path).await?;
+        Ok(vault)
+    }
+
+    /// The path must sit in this home, and the worker, running as the caller,
+    /// must be able to stat the folder or the archive and see this uid.
+    /// Anything else, including a stat that fails, is not found.
+    async fn confirm_owner(&self, account: &Account, path: &Path) -> Result<(), HelperError> {
+        if path != account.home && !path.starts_with(&account.home) {
             return Err(vault_not_found());
         }
-        Ok(vault)
+        let uid = account.uid;
+        let gid = account.gid;
+        let home = account.home.clone();
+        let path = path.to_path_buf();
+        let shown = path.display().to_string();
+        let vaults = self.vaults.share();
+        let live = Arc::clone(&self.workers);
+        let owner = tokio::task::spawn_blocking(move || {
+            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, live)?;
+            worker.owner_of(&path)
+        })
+        .await
+        .map_err(|error| failed("reading the owner", &shown, error))?;
+        match owner {
+            Ok(owner) if owner == uid => Ok(()),
+            Ok(_) => Err(vault_not_found()),
+            Err(HelperError::Failed(message)) if message.contains("cannot see the owner") => {
+                Err(vault_not_found())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The worker scans the owner's processes. The helper always scans root's,
@@ -505,10 +554,11 @@ impl Helper {
             }
         }
         let path = vault.path.clone();
+        self.before_mutation();
         let (_stored_path, _previous) = self
             .vaults
             .begin_lock(account.uid, name)
-            .map_err(|error| failed("locking", name, error))?;
+            .map_err(|error| vault_error("locking", name, error))?;
         let mut rollback = DiskReconcile {
             armed: true,
             uid: account.uid,
@@ -554,7 +604,7 @@ impl Helper {
         }
         self.vaults
             .set_state(account.uid, name, State::Locked)
-            .map_err(|error| failed("locking", name, error))?;
+            .map_err(|error| vault_error("locking", name, error))?;
         rollback.armed = false;
         self.passphrases.forget(account.uid, name)?;
         Ok(())
@@ -593,10 +643,11 @@ impl Helper {
             .ask(Purpose::Unlock, name, &prompt)
             .await
             .map_err(|error| named_pin("asking for the passphrase", name, error))?;
+        self.before_mutation();
         let path = self
             .vaults
             .begin_unlock(account.uid, name)
-            .map_err(|error| failed("unlocking", name, error))?;
+            .map_err(|error| vault_error("unlocking", name, error))?;
         let mut rollback = DiskReconcile {
             armed: true,
             uid: account.uid,
@@ -622,7 +673,7 @@ impl Helper {
         .map_err(|error| failed("unlocking", name, error))??;
         self.vaults
             .set_state(account.uid, name, State::Unlocked)
-            .map_err(|error| failed("unlocking", name, error))?;
+            .map_err(|error| vault_error("unlocking", name, error))?;
         rollback.armed = false;
         self.keep(account.uid, name, passphrase)?;
         self.shutdown_handle().arm_inhibitor().await;
@@ -642,18 +693,42 @@ impl Helper {
         let listed = tokio::task::spawn_blocking(move || vaults.list())
             .await
             .map_err(|error| failed("listing", "registry", error))?
-            .map_err(|error| failed("listing", "registry", error))?;
-        Ok(listed
+            .map_err(|error| vault_error("listing", "registry", error))?;
+        let mine: Vec<_> = listed
             .into_iter()
             .filter(|vault| {
-                vault.uid == account.uid && caller_owns(&account.home, account.uid, &vault.path)
+                vault.uid == account.uid
+                    && (vault.path == account.home || vault.path.starts_with(&account.home))
             })
-            .map(|vault| VaultStatus {
-                name: vault.name,
-                path: vault.path.display().to_string(),
-                state: state_wire(vault.state).to_string(),
-            })
-            .collect())
+            .collect();
+        if mine.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uid = account.uid;
+        let gid = account.gid;
+        let home = account.home.clone();
+        let vaults = self.vaults.share();
+        let live = Arc::clone(&self.workers);
+        tokio::task::spawn_blocking(move || {
+            let mut worker = worker::HomeWorker::spawn(uid, gid, &home, vaults, live)?;
+            let mut kept = Vec::new();
+            for vault in mine {
+                match worker.owner_of(&vault.path) {
+                    Ok(owner) if owner == uid => kept.push(VaultStatus {
+                        name: vault.name,
+                        path: vault.path.display().to_string(),
+                        state: state_wire(vault.state).to_string(),
+                    }),
+                    Ok(_) => {}
+                    Err(HelperError::Failed(message))
+                        if message.contains("cannot see the owner") => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(kept)
+        })
+        .await
+        .map_err(|error| failed("listing", "registry", error))?
     }
 
     async fn remove(
@@ -686,10 +761,11 @@ impl Helper {
                 .ask(Purpose::Unlock, name, &prompt)
                 .await
                 .map_err(|error| named_pin("asking for the passphrase", name, error))?;
+            self.before_mutation();
             let path = self
                 .vaults
                 .begin_unlock(account.uid, name)
-                .map_err(|error| failed("removing", name, error))?;
+                .map_err(|error| vault_error("removing", name, error))?;
             let mut rollback = DiskReconcile {
                 armed: true,
                 uid: account.uid,
@@ -714,9 +790,10 @@ impl Helper {
             .map_err(|error| failed("removing", name, error))??;
             self.vaults
                 .set_state(account.uid, name, State::Unlocked)
-                .map_err(|error| failed("removing", name, error))?;
+                .map_err(|error| vault_error("removing", name, error))?;
             rollback.armed = false;
         }
+        self.before_mutation();
         let vaults = self.vaults_for(&account)?;
         let uid = account.uid;
         let name_owned = name.to_string();
@@ -724,7 +801,7 @@ impl Helper {
         tokio::task::spawn_blocking(move || vaults.unregister(uid, &name_owned))
             .await
             .map_err(|error| failed("removing", &vault_name, error))?
-            .map_err(|error| failed("removing", name, error))?;
+            .map_err(|error| vault_error("removing", name, error))?;
         self.passphrases.forget(account.uid, name)?;
         Ok(())
     }
@@ -827,6 +904,7 @@ impl Helper {
             .await
             .map_err(|error| failed("terminating", name, error))??;
         }
+        self.before_mutation();
         let vaults = self.vaults_for(&account)?;
         let uid = account.uid;
         let name_owned = name.to_string();
@@ -834,7 +912,7 @@ impl Helper {
         tokio::task::spawn_blocking(move || vaults.unregister(uid, &name_owned))
             .await
             .map_err(|error| failed("terminating", &vault_name, error))?
-            .map_err(|error| failed("terminating", name, error))?;
+            .map_err(|error| vault_error("terminating", name, error))?;
         self.passphrases.forget(account.uid, name)?;
         Ok(())
     }
@@ -892,14 +970,14 @@ pub(crate) fn reconcile_from_disk(
     if !facts.folder && !facts.archive {
         vaults
             .unregister(uid, name)
-            .map_err(|error| failed("reconciling", name, error))?;
+            .map_err(|error| vault_error("reconciling", name, error))?;
         worker.remove_bookmark(path)?;
         return Ok(());
     }
     if facts.archive {
         vaults
             .set_state(uid, name, State::Locked)
-            .map_err(|error| failed("reconciling", name, error))?;
+            .map_err(|error| vault_error("reconciling", name, error))?;
         if let Err(error) = worker.seal(path) {
             eprintln!("linux-vault-helper: sealing {name} for uid {uid}: {error}");
         }
@@ -912,7 +990,7 @@ pub(crate) fn reconcile_from_disk(
     };
     vaults
         .set_state(uid, name, state)
-        .map_err(|error| failed("reconciling", name, error))
+        .map_err(|error| vault_error("reconciling", name, error))
 }
 
 fn failed(step: &str, target: &str, error: impl std::fmt::Display) -> HelperError {
@@ -920,8 +998,15 @@ fn failed(step: &str, target: &str, error: impl std::fmt::Display) -> HelperErro
 }
 
 /// Missing and owned by someone else are the same error, with the same text.
-fn vault_not_found() -> HelperError {
+pub(crate) fn vault_not_found() -> HelperError {
     HelperError::NotFound("vault not found".into())
+}
+
+fn vault_error(step: &str, target: &str, error: linux_vault::Error) -> HelperError {
+    match error {
+        linux_vault::Error::NotFound => vault_not_found(),
+        other => failed(step, target, other),
+    }
 }
 
 fn pin_error(error: PinentryError) -> HelperError {
@@ -959,34 +1044,6 @@ fn state_wire(state: State) -> &'static str {
         State::Locking => "locking",
         State::Unlocking => "unlocking",
     }
-}
-
-/// The vault lives in this caller's home, and its folder or archive is owned
-/// by this caller's UID. Anything else is omitted, including the name.
-fn caller_owns(home: &Path, uid: u32, vault: &Path) -> bool {
-    if vault != home && !vault.starts_with(home) {
-        return false;
-    }
-    match file_owner(vault) {
-        Some(owner) => owner == uid,
-        // Mode 700 is not stat-able as root. The path is already under this home.
-        None => true,
-    }
-}
-
-fn file_owner(vault: &Path) -> Option<u32> {
-    let path = if vault.is_dir() {
-        vault.to_path_buf()
-    } else {
-        let name = vault.file_name()?.to_str()?;
-        let archive = vault.with_file_name(format!("{name}.7z"));
-        if archive.is_file() {
-            archive
-        } else {
-            vault.parent()?.to_path_buf()
-        }
-    };
-    std::fs::symlink_metadata(path).ok().map(|meta| meta.uid())
 }
 
 /// Compare every byte. A mismatch does not return at the first difference.
@@ -1190,20 +1247,66 @@ mod not_found {
         let other = account(20, elsewhere);
         let missing = helper.owned_vault(&owner, "NoSuch").await.unwrap_err();
         let foreign = helper.owned_vault(&other, "Forge").await.unwrap_err();
-        // The file is owned by this process, not uid 10, so the registered
-        // name is also refused.
-        assert_ne!(
-            fs::metadata(&folder).unwrap().uid(),
-            owner.uid,
-            "the fixture must not be owned by the registry uid"
-        );
-        let mismatched = helper.owned_vault(&owner, "Forge").await.unwrap_err();
         assert!(shows_not_found(&missing), "{missing}");
         assert_eq!(missing.to_string(), foreign.to_string());
         assert_eq!(missing.name().as_str(), foreign.name().as_str());
         assert_eq!(missing.description(), foreign.description());
-        assert_eq!(missing.to_string(), mismatched.to_string());
-        assert_eq!(missing.description(), mismatched.description());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_mode_700_home_refuses_a_folder_owned_by_someone_else() {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = fs::metadata("/proc/self").unwrap();
+        let uid = meta.uid();
+        let gid = meta.gid();
+        let dir = std::env::temp_dir().join(format!("lve-mode700-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir(dir.join("home")).unwrap();
+        let home = dir.join("home").canonicalize().unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        let folder = home.join("Forge");
+        fs::create_dir(&folder).unwrap();
+        let (vaults, _) = linux_vault::Vaults::open(dir.join("registry"), &home)
+            .unwrap()
+            .trace_immutable_flag();
+        let caller = Account {
+            user: "caller".into(),
+            uid,
+            gid,
+            home: home.clone(),
+        };
+        let helper = Helper::new(
+            Authorizer::Allow,
+            vaults,
+            Prompt::Program(vec!["/bin/true".into()]),
+            caller.clone(),
+        )
+        .unwrap();
+        let absent = home.join("Absent");
+        helper.vaults.register_unlocked(uid, &absent).unwrap();
+        let unseen = helper.owned_vault(&caller, "Absent").await.unwrap_err();
+        assert!(shows_not_found(&unseen), "{unseen}");
+        let other = 65534u32;
+        let c_folder = std::ffi::CString::new(folder.to_str().unwrap()).unwrap();
+        if unsafe { nix::libc::chown(c_folder.as_ptr(), other, other) } != 0 {
+            let error = std::io::Error::last_os_error();
+            assert!(
+                error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(nix::libc::EINVAL),
+                "chown of the inner folder: {error}"
+            );
+            eprintln!(
+                "a_mode_700_home_refuses_a_folder_owned_by_someone_else: skipped the foreign owner, chown is not permitted"
+            );
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        helper.vaults.register_unlocked(uid, &folder).unwrap();
+        let refused = helper.owned_vault(&caller, "Forge").await.unwrap_err();
+        assert!(shows_not_found(&refused), "{refused}");
+        assert_eq!(refused.to_string(), unseen.to_string());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -354,9 +354,13 @@ impl ShutdownHandle {
         let passphrases = self.passphrases.clone();
         let live = Arc::clone(&self.workers);
         let locked = tokio::task::spawn_blocking(move || {
-            let (stored, _previous) = vaults
-                .begin_lock(uid, &name)
-                .map_err(|error| HelperError::Failed(format!("locking for {name}: {error}")))?;
+            let (stored, _previous) = vaults.begin_lock(uid, &name).map_err(|error| {
+                if matches!(error, linux_vault::Error::NotFound) {
+                    crate::vault_not_found()
+                } else {
+                    HelperError::Failed(format!("locking for {name}: {error}"))
+                }
+            })?;
             let mut worker = match crate::worker::HomeWorker::spawn(
                 uid,
                 gid,

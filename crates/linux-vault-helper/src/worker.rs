@@ -37,6 +37,7 @@ const ERR: u8 = 11;
 const FACTS: u8 = 12;
 const SEAL: u8 = 14;
 const SCAN: u8 = 15;
+const OWNER: u8 = 16;
 const MAX_BODY: usize = 1024 * 1024;
 
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -256,6 +257,12 @@ fn dispatch(vaults: &Vaults, tag: u8, body: &[u8]) -> std::io::Result<(u8, Vec<u
                     .map_err(|error| format!("sealing for {path}: {error}"))?;
                 Ok((OK, Vec::new()))
             }
+            OWNER => {
+                let path = std::str::from_utf8(body)
+                    .map_err(|error| format!("reading the owner for worker command: {error}"))?;
+                let uid = owner_of(Path::new(path))?;
+                Ok((OK, uid.to_le_bytes().to_vec()))
+            }
             SCAN => {
                 let split = body.iter().position(|byte| *byte == 0).ok_or_else(|| {
                     "checking open files for worker command: missing a vault path".to_string()
@@ -317,6 +324,26 @@ fn open_archive(path: &Path) -> std::io::Result<OwnedFd> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// The caller can see this path. A missing folder or archive, or a parent
+/// this user cannot search, is a failure. There is no fallback to the parent.
+fn owner_of(vault: &Path) -> Result<u32, String> {
+    if let Some(uid) = uid_of(vault) {
+        return Ok(uid);
+    }
+    if let Some(name) = vault.file_name().and_then(|name| name.to_str()) {
+        let archive = vault.with_file_name(format!("{name}.7z"));
+        if let Some(uid) = uid_of(&archive) {
+            return Ok(uid);
+        }
+    }
+    Err(format!("cannot see the owner of {}", vault.display()))
+}
+
+fn uid_of(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path).ok().map(|meta| meta.uid())
 }
 
 fn path_bytes(path: &Path) -> Vec<u8> {
@@ -399,6 +426,22 @@ impl HomeWorker {
                 ))
             })?;
         Ok(worker)
+    }
+
+    /// UID of the folder, or of the archive when the folder is gone.
+    /// Fails when this user cannot stat either one.
+    pub fn owner_of(&mut self, path: &Path) -> Result<u32, HelperError> {
+        let body = self
+            .roundtrip(OWNER, &path_bytes(path))
+            .map_err(|error| step_error("reading the owner", path, error))?;
+        let bytes: [u8; 4] = body.as_slice().try_into().map_err(|_| {
+            step_error(
+                "reading the owner",
+                path,
+                HelperError::Failed("worker sent a short owner id".into()),
+            )
+        })?;
+        Ok(u32::from_le_bytes(bytes))
     }
 
     pub fn resolve(&mut self, path: &Path) -> Result<PathBuf, HelperError> {

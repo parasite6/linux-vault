@@ -74,4 +74,19 @@ mod tests {
             .expect("the same vault never ran")
             .unwrap();
     }
+
+    #[tokio::test]
+    async fn two_users_hold_the_same_name_at_once() {
+        let locks = Arc::new(VaultLocks::new());
+        let first = locks.acquire(1, "Forge").await;
+        let other = Arc::clone(&locks);
+        let overlapped = tokio::spawn(async move {
+            let _guard = other.acquire(2, "Forge").await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), overlapped)
+            .await
+            .expect("uid 2 waited for uid 1's Forge")
+            .unwrap();
+        drop(first);
+    }
 }

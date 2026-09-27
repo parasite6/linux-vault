@@ -80,6 +80,10 @@ struct Session {
 }
 
 async fn session(mode: &str, authorizer: Authorizer) -> Session {
+    start_session(mode, authorizer, false).await
+}
+
+async fn start_session(mode: &str, authorizer: Authorizer, drop_forge: bool) -> Session {
     let dir = TempDir::new();
     let script = dir.path.join("pinentry");
     let log = dir.path.join("log");
@@ -93,7 +97,9 @@ async fn session(mode: &str, authorizer: Authorizer) -> Session {
     let (vaults, _) = Vaults::open(dir.path.join("registry"), &dir.path)
         .unwrap()
         .trace_immutable_flag();
+    let shared = vaults.share();
     let meta = fs::metadata("/proc/self").unwrap();
+    let uid = meta.uid();
     let helper = Helper::new(
         authorizer,
         vaults,
@@ -110,6 +116,11 @@ async fn session(mode: &str, authorizer: Authorizer) -> Session {
         },
     )
     .unwrap();
+    if drop_forge {
+        helper.set_before_mutation(move || {
+            let _ = shared.unregister(uid, "Forge");
+        });
+    }
     let guid = Guid::generate();
     let (client_stream, server_stream) = UnixStream::pair().unwrap();
     let server = Builder::unix_stream(server_stream)
@@ -240,6 +251,17 @@ async fn an_open_file_a_wrong_passphrase_and_a_denial_have_their_own_codes() {
     let denied = session("secret", Authorizer::Deny).await;
     let (code, _out, err) = invoke(&denied, &["ls"]).await;
     assert_eq!(code, NOT_AUTHORIZED, "{err}");
+}
+
+#[tokio::test]
+async fn a_vault_removed_before_the_write_is_not_found() {
+    let session = start_session("secret", Authorizer::Allow, true).await;
+    let folder = session.dir.path.join("Forge");
+    let (code, _out, err) = invoke(&session, &["create", folder.to_str().unwrap()]).await;
+    assert_eq!(code, OK, "{err}");
+    let (code, _out, err) = invoke(&session, &["lock", "Forge"]).await;
+    assert_eq!(code, NOT_FOUND, "{err}");
+    assert!(err.contains("vault not found"), "{err}");
 }
 
 #[tokio::test]
