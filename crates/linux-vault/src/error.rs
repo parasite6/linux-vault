@@ -16,8 +16,13 @@ pub enum Error {
     },
     /// No vault is registered under this name.
     NotFound,
-    /// A vault with this name or path is already registered, or the archive already exists.
+    /// A vault with this path is already registered, or the archive already exists.
     AlreadyExists,
+    /// This caller already has a vault with this folder name at another path.
+    NameTaken {
+        name: String,
+        path: std::path::PathBuf,
+    },
     /// The folder is inside another vault, or contains one.
     Nested {
         name: String,
@@ -62,6 +67,13 @@ impl fmt::Display for Error {
             Error::WrongPassphrase { message } => write!(f, "wrong passphrase: {message}"),
             Error::NotFound => write!(f, "vault not found"),
             Error::AlreadyExists => write!(f, "vault already exists"),
+            Error::NameTaken { name, path } => {
+                write!(
+                    f,
+                    "Cannot create {name}: you already have a vault named {name} at {}.\nTwo vaults cannot have the same name. Rename one of the folders and try again.",
+                    path.display()
+                )
+            }
             Error::Nested {
                 name,
                 other,

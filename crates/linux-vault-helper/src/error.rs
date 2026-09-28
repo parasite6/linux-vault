@@ -25,6 +25,8 @@ pub enum HelperError {
     Empty(String),
     /// The folder is inside another vault, or contains one.
     Nested(String),
+    /// This caller already has a vault with this folder name at another path.
+    NameTaken(String),
     /// `registry.json` was moved aside. No method runs until the helper is restarted.
     RegistryBroken(String),
     /// Pinentry or the vault operation failed. The message has no passphrase.

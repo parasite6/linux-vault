@@ -9,8 +9,8 @@ use linux_vault::Vaults;
 use linux_vault_dbus::OBJECT_PATH;
 use linux_vault_helper::{Account, Authorizer, Helper, Prompt};
 use linux_vault_lve::{
-    parse, run, write_usage, Invocation, CANCELLED, NEEDS_RECOVERY, NOT_AUTHORIZED, NOT_FOUND, OK,
-    OPEN_FILE, USAGE, WRONG_PASSPHRASE,
+    parse, run, write_usage, Invocation, CANCELLED, NAME_TAKEN, NEEDS_RECOVERY, NOT_AUTHORIZED,
+    NOT_FOUND, OK, OPEN_FILE, USAGE, WRONG_PASSPHRASE,
 };
 use tokio::net::UnixStream;
 use zbus::connection::Builder;
@@ -163,8 +163,16 @@ async fn invoke(session: &Session, args: &[&str]) -> (u8, String, String) {
 fn usage_does_not_need_the_helper() {
     let mut err = Vec::new();
     write_usage(&mut err);
+    let usage = String::from_utf8(err).unwrap();
     assert!(parse(&[]).unwrap_err() == USAGE);
-    assert!(String::from_utf8(err).unwrap().contains("--help"));
+    assert!(usage.contains("--help"), "{usage}");
+    let mut out = Vec::new();
+    linux_vault_lve::write_help(&mut out);
+    let help = String::from_utf8(out).unwrap();
+    assert!(
+        help.contains("15  you already have a vault with that name"),
+        "{help}"
+    );
 }
 
 #[tokio::test]
@@ -253,6 +261,37 @@ async fn an_open_file_a_wrong_passphrase_and_a_denial_have_their_own_codes() {
     let denied = session("secret", Authorizer::Deny).await;
     let (code, _out, err) = invoke(&denied, &["ls"]).await;
     assert_eq!(code, NOT_AUTHORIZED, "{err}");
+}
+
+#[tokio::test]
+async fn a_repeated_name_at_another_path_exits_15() {
+    let session = session("secret", Authorizer::Allow).await;
+    let videos = session.dir.path.join("Videos");
+    fs::create_dir(&videos).unwrap();
+    let first = videos.join("Test");
+    let (code, _, err) = invoke(&session, &["create", first.to_str().unwrap()]).await;
+    assert_eq!(code, OK, "{err}");
+
+    let desk = session.dir.path.join("Desk");
+    fs::create_dir(&desk).unwrap();
+    let second = desk.join("Test");
+    let (code, _, err) = invoke(&session, &["create", second.to_str().unwrap()]).await;
+    assert_eq!(code, NAME_TAKEN, "{err}");
+    assert!(
+        err.contains("Cannot create Test: you already have a vault named Test at ~/Videos/Test."),
+        "{err}"
+    );
+    assert!(
+        err.contains(
+            "Two vaults cannot have the same name. Rename one of the folders and try again."
+        ),
+        "{err}"
+    );
+
+    let (code, _, err) = invoke(&session, &["create", first.to_str().unwrap()]).await;
+    assert_ne!(code, NAME_TAKEN, "{err}");
+    assert!(err.contains("vault already exists"), "{err}");
+    assert!(!err.contains("Two vaults cannot"), "{err}");
 }
 
 #[tokio::test]

@@ -611,6 +611,9 @@ impl Helper {
                     .register_unlocked(uid, &canonical)
                     .map_err(|error| match &error {
                         linux_vault::Error::Nested { .. } => HelperError::Nested(error.to_string()),
+                        linux_vault::Error::NameTaken { name, path } => {
+                            HelperError::NameTaken(name_taken_message(name, &home, path))
+                        }
                         _ => failed("creating", &canonical.display().to_string(), error),
                     })?;
             keep_bookmark(&mut worker, &canonical, &created.name);
@@ -1309,6 +1312,9 @@ fn vault_error(step: &str, target: &str, error: linux_vault::Error) -> HelperErr
             HelperError::RegistryBroken(message.clone())
         }
         linux_vault::Error::Nested { .. } => HelperError::Nested(error.to_string()),
+        linux_vault::Error::NameTaken { name, path } => {
+            HelperError::NameTaken(name_taken_message(name, Path::new(""), path))
+        }
         _ => failed(step, target, error),
     }
 }
@@ -1338,6 +1344,23 @@ fn folder_name(path: &str) -> Result<String, HelperError> {
         .filter(|name| plain_vault_name(name))
         .map(str::to_string)
         .ok_or_else(|| HelperError::Failed("vault path has no folder name".into()))
+}
+
+/// `~/Videos/Test` when `path` is inside `home`. Another user's path is not used here.
+fn name_taken_message(name: &str, home: &Path, existing: &Path) -> String {
+    let shown = if !home.as_os_str().is_empty() && existing == home {
+        "~".to_string()
+    } else if !home.as_os_str().is_empty() {
+        existing
+            .strip_prefix(home)
+            .map(|rest| format!("~/{}", rest.display()))
+            .unwrap_or_else(|_| existing.display().to_string())
+    } else {
+        existing.display().to_string()
+    };
+    format!(
+        "Cannot create {name}: you already have a vault named {name} at {shown}.\nTwo vaults cannot have the same name. Rename one of the folders and try again."
+    )
 }
 
 fn listed_state(vault: &linux_vault::Vault) -> String {

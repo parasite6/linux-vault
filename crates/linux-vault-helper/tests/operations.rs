@@ -207,6 +207,69 @@ async fn proxy(connection: &zbus::Connection) -> HelperProxy<'_> {
 }
 
 #[tokio::test]
+async fn a_name_taken_by_you_is_not_a_name_taken_by_someone_else() {
+    let session = session("secret").await;
+    let proxy = proxy(&session.client).await;
+    let videos = session.dir.path.join("Videos");
+    fs::create_dir(&videos).unwrap();
+    let first = videos.join("Test");
+    proxy.create(first.to_str().unwrap()).await.unwrap();
+
+    let desk = session.dir.path.join("Desk");
+    fs::create_dir(&desk).unwrap();
+    let taken = proxy
+        .create(desk.join("Test").to_str().unwrap())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(taken.contains("org.linuxvault.Error.NameTaken"), "{taken}");
+    assert!(
+        taken.contains("you already have a vault named Test at ~/Videos/Test."),
+        "{taken}"
+    );
+    assert!(
+        taken.contains(
+            "Two vaults cannot have the same name. Rename one of the folders and try again."
+        ),
+        "{taken}"
+    );
+
+    let again = proxy
+        .create(first.to_str().unwrap())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(again.contains("vault already exists"), "{again}");
+    assert!(!again.contains("NameTaken"), "{again}");
+    assert!(!again.contains("Two vaults cannot"), "{again}");
+
+    let other = caller_uid().wrapping_add(1);
+    let theirs = session.dir.path.join("theirs");
+    fs::create_dir(&theirs).unwrap();
+    let their_test = theirs.join("Sample");
+    fs::create_dir(&their_test).unwrap();
+    Vaults::open(session.dir.path.join("registry"), &session.dir.path)
+        .unwrap()
+        .register_unlocked(other, &their_test)
+        .unwrap();
+    let mine = session.dir.path.join("mine");
+    fs::create_dir(&mine).unwrap();
+    proxy
+        .create(mine.join("Sample").to_str().unwrap())
+        .await
+        .unwrap();
+    let listed = proxy.list().await.unwrap();
+    assert!(
+        listed.iter().any(|vault| vault.name == "Sample"),
+        "{listed:?}"
+    );
+    assert!(
+        listed.iter().all(|vault| !vault.path.contains("theirs")),
+        "{listed:?}"
+    );
+}
+
+#[tokio::test]
 async fn create_asks_twice_and_registers_the_folder() {
     let session = session("secret").await;
     let proxy = proxy(&session.client).await;

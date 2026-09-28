@@ -1,6 +1,6 @@
 [package]
 name = "linux-vault"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 publish = false
 description = "Lock, test, delete, and unlock a vault with 7z. No root, D-Bus, or pinentry."

@@ -25,6 +25,7 @@ pub const NOT_FOUND: u8 = 11;
 pub const EMPTY: u8 = 12;
 pub const NESTED: u8 = 13;
 pub const REGISTRY_BROKEN: u8 = 14;
+pub const NAME_TAKEN: u8 = 15;
 
 const HELP: &str = "\
 lve — lock a folder in your home
@@ -58,6 +59,7 @@ Exit codes:
   12  vault is empty
   13  the folder is inside another vault, or contains one
   14  the vault registry is damaged
+  15  you already have a vault with that name
 ";
 
 #[derive(Debug)]
@@ -352,7 +354,11 @@ fn spoken(error: &zbus::Error) -> String {
     if name.ends_with("WrongPassphrase") {
         return "Wrong password.".into();
     }
-    if name.ends_with("Empty") || name.ends_with("Nested") || name.ends_with("RegistryBroken") {
+    if name.ends_with("Empty")
+        || name.ends_with("Nested")
+        || name.ends_with("RegistryBroken")
+        || name.ends_with("NameTaken")
+    {
         return detail;
     }
     let lower = detail.to_ascii_lowercase();
@@ -407,6 +413,9 @@ fn exit_code_for(name: &str, message: &str) -> u8 {
     }
     if name.ends_with("RegistryBroken") {
         return REGISTRY_BROKEN;
+    }
+    if name.ends_with("NameTaken") {
+        return NAME_TAKEN;
     }
     let lower = message.to_ascii_lowercase();
     if lower.contains("wrong passphrase") {
@@ -534,6 +543,13 @@ mod exit_tests {
                 "the vault registry is damaged; /var/lib/linux-vault/registry.json.broken-1 was kept aside. Restore or fix that file, then restart the helper"
             ),
             REGISTRY_BROKEN
+        );
+        assert_eq!(
+            exit_code_for(
+                "org.linuxvault.Error.NameTaken",
+                "Cannot create Test: you already have a vault named Test at ~/Videos/Test.\nTwo vaults cannot have the same name. Rename one of the folders and try again."
+            ),
+            NAME_TAKEN
         );
         assert_eq!(
             exit_code_for(

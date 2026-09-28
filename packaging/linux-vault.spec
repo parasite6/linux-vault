@@ -2,7 +2,7 @@
 %global debug_package %{nil}
 
 Name:           linux-vault
-Version:        0.1.8
+Version:        0.1.9
 Release:        1%{?dist}
 Summary:        Lock a folder in your home
 
@@ -70,6 +70,8 @@ install -D -m 0644 packaging/systemd/logind.conf.d/linux-vault.conf %{buildroot}
 %{_prefix}/lib/systemd/logind.conf.d/linux-vault.conf
 
 %changelog
+* Mon Sep 28 2026 parasite6 <myworkforstore@proton.me> - 0.1.9-1
+- Refuse a second vault with the same folder name, and say where the first one is.
 * Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.8-1
 - A locked archive whose filesystem rejects the immutable flag stays locked, and lve ls says it is not immutable.
 * Sun Sep 27 2026 parasite6 <myworkforstore@proton.me> - 0.1.7-1

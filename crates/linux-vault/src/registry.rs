@@ -213,12 +213,20 @@ impl Registry {
     }
 
     pub fn insert(&mut self, record: Record) -> Result<()> {
-        if self
+        if let Some(existing) = self
             .vaults
             .iter()
-            .any(|existing| existing.uid == record.uid && existing.name == record.name)
+            .find(|existing| existing.uid == record.uid && existing.name == record.name)
         {
-            return Err(Error::AlreadyExists);
+            let same_path = existing.path == record.path
+                || canonical_path(&existing.path) == canonical_path(&record.path);
+            if same_path {
+                return Err(Error::AlreadyExists);
+            }
+            return Err(Error::NameTaken {
+                name: record.name,
+                path: existing.path.clone(),
+            });
         }
         if self
             .vaults
