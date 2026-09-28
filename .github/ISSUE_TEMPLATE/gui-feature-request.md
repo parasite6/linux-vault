@@ -1,7 +1,7 @@
 ---
 name: GUI Feature Request
 about: Request a type of UI or App and ideas
-title: ''
+title: GUI Feature RQ
 labels: enhancement
 assignees: parasite6
 type: Feature
@@ -15,4 +15,4 @@ A clear and concise description of what the problem is. Ex. I'm always frustrate
 A clear and concise description of what you want to happen.
 
 **Additional context**
-Add any other context or screenshots about the feature request here.
+Add any other context, screenshots or images about the App/GUI Design
